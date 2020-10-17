@@ -8,7 +8,8 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mc
 import colorsys, os, obspy, warnings
 import seaborn as sns
-from obspy import read, Stream, UTCDateTime
+from functools import partial
+from obspy import read, Trace, Stream, UTCDateTime
 from obspy.clients.fdsn.mass_downloader import RectangularDomain, Restrictions, MassDownloader
 from obspy.signal.trigger import coincidence_trigger
 from obspy.signal.cross_correlation import correlate
@@ -16,6 +17,7 @@ from obspy.signal.polarization import flinn
 from obspy.signal.freqattributes import spectrum
 from matplotlib import rc
 from matplotlib.backends.backend_pdf import PdfPages
+from multiprocessing import cpu_count, Pool
 
 # define constants
 __chunklength_in_sec = 86400
@@ -102,20 +104,35 @@ def __download_waveforms(network, station, location, channel, t1, t2, waveform_n
 
 
 # define functions to find events in a single seismometer or coincident events across multiple seismometers based on the quadrature sum of their components
-def get_events(stream, starttime, endtime, signal_type='amplitude', trigger_type='recstalta', thr_coincidence_sum=-1, thr_event_offset=0.5, thr_on=5, thr_off=1, **options):
+def get_events(stream, starttime, endtime, signal_type='amplitude', trigger_type='recstalta', thr_event_join=0.5, thr_travel_time=0.01, thr_coincidence_sum=-1, thr_on=5, thr_off=1, **options):
 
-    # create a copy of the input stream separated into streams for each seismometer and with components added in quadrature (i.e. energy)
-    stream_list = group_components(stream, signal_type=signal_type)
+    # create a copy of the input stream separated into streams for each seismometer
+    component_list = __group_seismometers(stream)
+    # and with components added in quadrature (i.e. energy)
+    stream_list = group_components(component_list, signal_type=signal_type)
 
-    # find list of events for each seismometer based on the stream of energies
+    # find list of events for each seismometer based on the stream of amplitudes/energies
     events_list = []
     for i in range(0, len(stream_list)):
+        # trigger events using specified event detection algorithm
         events = coincidence_trigger(trigger_type=trigger_type, thr_on=thr_on, thr_off=thr_off, stream=stream_list[i], thr_coincidence_sum=1, details=True, **options)
+        
+        # create reporting functions for input into the conicidence triggering algorithms to join events over small gaps
+        if thr_event_join > 0:
+            # lengthen all events
+            report_stream = __reporting_functions(stream_list, events, thr_event_join)
+            events = coincidence_trigger(trigger_type='classicstalta', thr_on=1.001, thr_off=1, stream=report_stream, thr_coincidence_sum=1, details=True, sta=1./report_stream[0].stats.sampling_rate, lta=3./report_stream[0].stats.sampling_rate)
+            # shorten joined events (i.e. start and end times will match original)
+            report_stream = __reporting_functions(stream_list, events, -thr_event_join)
+            events = coincidence_trigger(trigger_type='classicstalta', thr_on=1.001, thr_off=1, stream=report_stream, thr_coincidence_sum=1, details=True, sta=1./report_stream[0].stats.sampling_rate, lta=3./report_stream[0].stats.sampling_rate)
+            
+        # append event list to file
         events_list.append(events)
 
-    if thr_event_offset > 0 or len(events_list) > 1:
-        # create reporting functions for input into the conicidence triggering algorithms to find overlapping events
-        report_stream = __reporting_functions(stream_list, events_list, thr_event_offset)
+    # find list of events for array of seismometers based on the event catalogues
+    if len(events_list) > 1:
+        # create reporting functions for input into the conicidence triggering algorithms to events triggered at multiple seismometers
+        report_stream = __reporting_functions(stream_list, events_list, max(0.01, thr_travel_time))
 
         # apply coincidence triggering to reporting functions
         if thr_coincidence_sum <= 0:
@@ -126,7 +143,7 @@ def get_events(stream, starttime, endtime, signal_type='amplitude', trigger_type
             # if not all seismographs need an event we need to combine the coincident events from different sets of seismographs
             if len(events_list) > thr_coincidence_sum:
                 # create new reporting functions to merge events from coincident trigger function
-                report_stream = __reporting_functions(stream_list, coincident_events, thr_event_offset)
+                report_stream = __reporting_functions(stream_list, coincident_events, 0.01)
                 coincident_events = coincidence_trigger(trigger_type='classicstalta', thr_on=1.001, thr_off=1, stream=report_stream, thr_coincidence_sum=1, details=True, sta=1./report_stream[0].stats.sampling_rate, lta=3./report_stream[0].stats.sampling_rate)
         
     else:
@@ -139,10 +156,11 @@ def get_events(stream, starttime, endtime, signal_type='amplitude', trigger_type
     else:
         raise Exception('Start/end time and stream are for different time periods.')
 
-    # remove events outside requested time window
+    # remove events outside requested time window and less than 10 times the sampling rate
     events_df = events_df[np.logical_and(events_df['time'] + events_df['duration'] > starttime, events_df['time'] < endtime)]
+    events_df = events_df[events_df['duration'] > 10./stream[0].stats.sampling_rate]
     events_df.reset_index(drop=True, inplace=True)
-
+    
     # add column to store signal_type used in triggering
     if signal_type == 'amplitude':
         events_df['signal_type'] = 'amplitude'
@@ -173,8 +191,8 @@ def __reporting_functions(stream_list, events_list, thr_event_offset):
             times = np.asarray(report_stream[k].times())
             for l in range(0, len(events)):
                 # find start and end time of event in seconds from start of stream
-                start_time = float(events[l]['time']) - float(report_stream[k].stats.starttime) - thr_event_offset/2
-                end_time = float(events[l]['time'] + events[l]['duration']) - float(report_stream[k].stats.starttime) + thr_event_offset/2
+                start_time = float(events[l]['time']) - float(report_stream[k].stats.starttime) - thr_event_offset/2.
+                end_time = float(events[l]['time'] + events[l]['duration']) - float(report_stream[k].stats.starttime) + thr_event_offset/2.
                 # find indices of each event
                 index = np.searchsorted(times, np.arange(start_time, end_time, 1./report_stream[k].stats.sampling_rate))
                 # remove indices outside the range of the stream
@@ -190,66 +208,45 @@ def __reporting_functions(stream_list, events_list, thr_event_offset):
     
     return report_stream
 
-def group_components(stream, signal_type='amplitude'):
+def group_components(component_list, signal_type='amplitude'):
+    
+    # convert stream to a list if it is a Stream object for a single seismometer
+    if not isinstance(component_list, (list, np.ndarray)):
+        component_list = [component_list]
     
     # create lists to store streams for each seismometer (if applicable)
     stream_list = [] # total amplitude (or energy)
-    # create list to store weighted means for each component at each seismometer
-    mean_list = []
-
-    # find mean of each component at each station
-    for i in range(0, len(stream)):
-        count = 0
-        mean = 0
-        for j in range(0, len(stream)):
-            # find matching seismometer and component in the list
-            if (stream[i].stats.network == stream[j].stats.network and stream[i].stats.station == stream[j].stats.station and stream[i].stats.channel == stream[j].stats.channel):
-                count += len(stream[j].data)
-                mean += np.sum(stream[j].data)
+    
+    # combine traces at each seismometer in quadrature as appropriate
+    for i in range(0, len(component_list)):
+        # find mean of each component at the given seismometer
+        mean_list = []
         # calculate weighted mean for the seismometer and component in this trace
-        mean_list.append(float(mean)/count)
-
-    # create a copy of the input stream with components added in quadrature
-    for i in range(0, len(stream)):
-        # create new stream object to store combined components
-        if i == 0:
-            new_stream = Stream(stream[0].copy())
-            new_stream[0].data = (stream[0].data - mean_list[0])**2
-            stream_list.append(new_stream)
-        else:
-            for j in range(0, len(stream_list)):
-                # test if current seismometer has a stream in the list
-                if (stream[i].stats.network == stream_list[j][0].stats.network and stream[i].stats.station == stream_list[j][0].stats.station and (stream[i].stats.channel)[0:-1] == (stream_list[j][0].stats.channel)[0:-1]):
-                    # seismometer in the list
-                    for k in range(0, len(stream_list[j])):
-                        # test if current time period is already in stream
-                        if abs(stream[i].stats.starttime - stream_list[j][k].stats.starttime) < 0.1: # same within 0.1 second; this will not join channels starting at different times
-                            # time period is in the stream
-                            stream_list[j][k].data += (stream[i].data - mean_list[i])**2
-                    
-                            # modify trace id to terminate in number of components
-                            if stream_list[j][k].id[-1].isnumeric() == True:
-                                stream_list[j][k].id = stream_list[j][k].id[:-1]+str(int(stream_list[j][k].id[-1]) + 1)
-                            else:
-                                stream_list[j][k].id = new_stream[j].id[:-1]+'2'
-                            break
-                    else:
-                        # time period is not in the stream so add it
-                        stream_list[j] += Stream(stream[i].copy())
-                        stream_list[j][-1].data = (stream[i].data - mean_list[i])**2
-                    break
-            else:
-                # seismometer not in the list; so add it
-                new_stream = Stream(stream[i].copy())
-                new_stream[0].data = (stream[i].data - mean_list[i])**2
+        for j in range(0, len(component_list[i])):
+            count = len(component_list[i][j].data)
+            mean = np.sum(component_list[i][j].data)
+            mean_list.append(float(mean)/count)
+    
+        for j in range(0, len(component_list[i])):
+            # create new stream object to store combined components
+            if j == 0:
+                new_stream = Stream(component_list[i][0].copy())
+                new_stream[0].data = (component_list[i][0].data - mean_list[0])**2
                 stream_list.append(new_stream)
+            else:
+                # add additional components to stream in quadrature
+                stream_list[i][0].data += (component_list[i][j].data - mean_list[j])**2
+            
+                # modify trace id to terminate in number of components
+                if stream_list[i][0].id[-1].isnumeric() == True:
+                    stream_list[i][0].id = stream_list[i][0].id[:-1]+str(int(stream_list[i][0].id[-1]) + 1)
+                else:
+                    stream_list[i][0].id = stream_list[i][0].id[:-1]+'2'
                 
-    # if requested output is amplitude convert data to amplitudes
-    if signal_type == 'amplitude':
-        for j in range(0, len(stream_list)):
-            for k in range(0, len(stream_list[j])):
-                stream_list[j][k].data = np.sqrt(stream_list[j][k].data)
-                
+        # if requested output is amplitude convert data to amplitudes
+        if signal_type == 'amplitude':
+            stream_list[i][0].data = np.sqrt(stream_list[i][0].data)
+        
     return stream_list
     
 def __group_seismometers(stream):
@@ -286,8 +283,10 @@ def plot_events(events, stream, starttime, endtime, filename=None):
     start_time = starttime
     end_time = min(endtime, start_of_day + __chunklength_in_sec)
 
-    # create a copy of the input stream separated into streams for each seismometer and with components added in quadrature (i.e. energy); only the first seismometer is plotted
-    stream_list = group_components(stream, signal_type=events['signal_type'][0])
+    # create a copy of the input stream separated into streams for each seismometer
+    component_list = __group_seismometers(stream)
+    # and with components added in quadrature (i.e. energy); 'amplitude' is very computationally intensive
+    stream_list = group_components(component_list, signal_type=events['signal_type'][0])
     new_stream = stream_list[0]
     print(new_stream)
 
@@ -341,10 +340,11 @@ def __plot_events(event_stream, stream, start_time, end_time, signal_type='ampli
     else:
         stream.plot(fig=fig, type="dayplot", interval=15, vertical_scaling_range=0.2*np.max(stream[0].data), color='lightgrey', starttime=start_time, endtime=end_time, title='')
     # add events over calendar day in red
-    if signal_type == 'amplitude':
-        event_stream.plot(fig=fig, type="dayplot", interval=15, vertical_scaling_range=0.5*np.max(stream[0].data), color='crimson', starttime=start_time, endtime=end_time, title='')
-    else:
-        event_stream.plot(fig=fig, type="dayplot", interval=15, vertical_scaling_range=0.2*np.max(stream[0].data), color='crimson', starttime=start_time, endtime=end_time, title='')
+    if len(event_stream) > 0:
+        if signal_type == 'amplitude':
+            event_stream.plot(fig=fig, type="dayplot", interval=15, vertical_scaling_range=0.5*np.max(stream[0].data), color='crimson', starttime=start_time, endtime=end_time, title='')
+        else:
+            event_stream.plot(fig=fig, type="dayplot", interval=15, vertical_scaling_range=0.2*np.max(stream[0].data), color='crimson', starttime=start_time, endtime=end_time, title='')
     
     # correct axis labels and ticks
     for item in (plt.gca().get_xticklabels() + plt.gca().get_yticklabels()):
@@ -446,7 +446,7 @@ def attribute_13_14_15_17(component_stream, event_start, event_stop):
     band_14 = np.sum(group_components((component_stream.copy()).filter("bandpass", freqmin=10, freqmax=50), signal_type='energy'))*component_stream[0].stats.delta
     band_15 = np.sum(group_components((component_stream.copy()).filter("bandpass", freqmin=5, freqmax=70), signal_type='energy'))*component_stream[0].stats.delta
     band_17 = np.sum(group_components((component_stream.copy()).filter("bandpass", freqmin=1, freqmax=20), signal_type='energy'))*component_stream[0].stats.delta
-
+    
     return ['attribute_13', 'attribute_14', 'attribute_15', 'attribute_17'], [band_13, band_14, band_15, band_17]
 
 def attribute_68_69_70_71(component_stream, event_start, event_stop):
