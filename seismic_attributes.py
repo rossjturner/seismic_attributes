@@ -1,23 +1,28 @@
 # seismic_attributes module
-# Ross Turner, 25 September 2020
+# Ross Turner, 16 January 2021
 
 # import packages
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.colors as mc
-import colorsys, os, obspy, warnings
+import matplotlib.dates as mdates
+import colorsys, datetime, os, obspy, pytz, warnings
 import seaborn as sns
 from functools import partial
-from obspy import read, Trace, Stream, UTCDateTime
+from math import factorial
+from obspy import read, read_inventory, Trace, Stream, UTCDateTime
 from obspy.clients.fdsn.mass_downloader import RectangularDomain, Restrictions, MassDownloader
-from obspy.signal.trigger import coincidence_trigger
+from obspy.geodetics import locations2degrees, degrees2kilometers
+from obspy.signal.trigger import trigger_onset
 from obspy.signal.cross_correlation import correlate
 from obspy.signal.polarization import flinn
-from obspy.signal.freqattributes import spectrum
-from matplotlib import rc
+from obspy.signal.filter import envelope
+from matplotlib import cm, rc
 from matplotlib.backends.backend_pdf import PdfPages
+from matplotlib.colors import ListedColormap,LinearSegmentedColormap
 from multiprocessing import cpu_count, Pool
+from numpy.fft import rfft, rfftfreq
 
 # define constants
 __chunklength_in_sec = 86400
@@ -38,10 +43,17 @@ def get_waveforms(network, station, location, channel, starttime, endtime, event
     else:
         stream = __get_waveforms(network, station, location, channel, starttime - event_buffer, endtime + event_buffer, waveform_name=waveform_name, station_name=station_name, provider=client, download=download)
 
-    # merge different days in the stream at the same seismograph and channel
-    stream.merge(method=0, fill_value=None)
+    # merge different days in the stream at the same seismograph and channel; this prevents masked arrays from being created
+    stream.merge(method=0, fill_value='interpolate')
     # sort channels into ZNE order for use in some obspy functions (only used for some attributes)
     stream.sort(keys=['network', 'station', 'location', 'channel'], reverse=True)
+    # truncate stream at requested time window with buffer either side
+    stream = stream.slice(starttime - event_buffer, endtime + event_buffer)
+    
+    # check all traces are the same length and start at the same time
+    for i in range(0, len(stream)):
+        if not (stream[i].stats.starttime == stream[0].stats.starttime and len(stream[i].data) == len(stream[0].data)):
+            raise Exception('Stream has one or more components with inconsistent start and end times! Download the data again if it exists or select a valid time period.')
 
     print(stream)
     return stream
@@ -104,109 +116,186 @@ def __download_waveforms(network, station, location, channel, t1, t2, waveform_n
 
 
 # define functions to find events in a single seismometer or coincident events across multiple seismometers based on the quadrature sum of their components
-def get_events(stream, starttime, endtime, signal_type='amplitude', trigger_type='recstalta', thr_event_join=0.5, thr_travel_time=0.01, thr_coincidence_sum=-1, thr_on=5, thr_off=1, **options):
+def get_events(stream, starttime, endtime, signal_type='amplitude', station_name='stations', trigger_type='recstalta', avg_wave_speed=2, thr_event_join=0.5, thr_coincidence_sum=-1, thr_on=5, thr_off=1, **options): # avg_wave_speed in km/s
 
     # create a copy of the input stream separated into streams for each seismometer
     component_list = __group_seismometers(stream)
     # and with components added in quadrature (i.e. energy)
     stream_list = group_components(component_list, signal_type=signal_type)
-
-    # find list of events for each seismometer based on the stream of amplitudes/energies
-    events_list = []
-    for i in range(0, len(stream_list)):
-        # trigger events using specified event detection algorithm
-        events = coincidence_trigger(trigger_type=trigger_type, thr_on=thr_on, thr_off=thr_off, stream=stream_list[i], thr_coincidence_sum=1, details=True, **options)
-        
-        # create reporting functions for input into the conicidence triggering algorithms to join events over small gaps
-        if thr_event_join > 0:
-            # lengthen all events
-            report_stream = __reporting_functions(stream_list, events, thr_event_join)
-            events = coincidence_trigger(trigger_type='classicstalta', thr_on=1.001, thr_off=1, stream=report_stream, thr_coincidence_sum=1, details=True, sta=1./report_stream[0].stats.sampling_rate, lta=3./report_stream[0].stats.sampling_rate)
-            # shorten joined events (i.e. start and end times will match original)
-            report_stream = __reporting_functions(stream_list, events, -thr_event_join)
-            events = coincidence_trigger(trigger_type='classicstalta', thr_on=1.001, thr_off=1, stream=report_stream, thr_coincidence_sum=1, details=True, sta=1./report_stream[0].stats.sampling_rate, lta=3./report_stream[0].stats.sampling_rate)
-            
-        # append event list to file
-        events_list.append(events)
-
-    # find list of events for array of seismometers based on the event catalogues
-    if len(events_list) > 1:
-        # create reporting functions for input into the conicidence triggering algorithms to events triggered at multiple seismometers
-        report_stream = __reporting_functions(stream_list, events_list, max(0.01, thr_travel_time))
-
-        # apply coincidence triggering to reporting functions
-        if thr_coincidence_sum <= 0:
-            coincident_events = coincidence_trigger(trigger_type='classicstalta', thr_on=1.001, thr_off=1, stream=report_stream, thr_coincidence_sum=len(events_list), details=True, sta=1./report_stream[0].stats.sampling_rate, lta=3./report_stream[0].stats.sampling_rate)
-        else:
-            coincident_events = coincidence_trigger(trigger_type='classicstalta', thr_on=1.001, thr_off=1, stream=report_stream, thr_coincidence_sum=min(len(events_list), thr_coincidence_sum), details=True, sta=1./report_stream[0].stats.sampling_rate, lta=3./report_stream[0].stats.sampling_rate)
-            
-            # if not all seismographs need an event we need to combine the coincident events from different sets of seismographs
-            if len(events_list) > thr_coincidence_sum:
-                # create new reporting functions to merge events from coincident trigger function
-                report_stream = __reporting_functions(stream_list, coincident_events, 0.01)
-                coincident_events = coincidence_trigger(trigger_type='classicstalta', thr_on=1.001, thr_off=1, stream=report_stream, thr_coincidence_sum=1, details=True, sta=1./report_stream[0].stats.sampling_rate, lta=3./report_stream[0].stats.sampling_rate)
-        
-    else:
-        # single set of events; no coincidence triggering
-        coincident_events = events_list[0]
     
+    # create new stream of the quadrature streams from each seismometer
+    new_stream = None
+    for i in range(0, len(stream_list)):
+        if i == 0:
+            new_stream = stream_list[0]
+        else:
+            new_stream = new_stream + stream_list[i]
+            
+    if thr_coincidence_sum <= 0:
+        thr_coincidence_sum = len(stream_list)
+    else:
+        thr_coincidence_sum = min(len(stream_list), thr_coincidence_sum)
+    
+    # get distances between array elements
+    distance = __get_distances(stream, starttime, station_name=station_name, thr_coincidence_sum=thr_coincidence_sum)
+
+    # trigger events using specified event detection algorithm
+    events, coincident_events = __coincidence_trigger(trigger_type=trigger_type, thr_on=thr_on, thr_off=thr_off, stream=new_stream, nseismometers=len(stream_list), thr_travel_time=distance/avg_wave_speed, thr_event_join=thr_event_join, thr_coincidence_sum=thr_coincidence_sum, **options)
+    
+    events_df, traces_df = __make_catalogues(coincident_events, stream, events, stream_list, starttime, endtime, signal_type, thr_travel_time=distance/avg_wave_speed, thr_coincidence_sum=thr_coincidence_sum)
+
+    return events_df, traces_df
+    
+def __get_distances(stream, starttime, station_name='stations', thr_coincidence_sum=1):
+    
+    if thr_coincidence_sum <= 1:
+        return 0
+    else:
+        # create list to store latitude and longitude of each unique seismometer
+        coordinates_list = []
+        seismometer_list = []
+        
+        # find coordinates of each unique seismometer, excluding channels
+        for i in range(0, len(stream)):
+            filename = station_name+'/'+stream[i].stats.network+'.'+stream[i].stats.station+'.xml'
+            location = stream[i].stats.network+'.'+stream[i].stats.station+'.'+stream[i].stats.location
+            if i == 0 or not np.any(location == np.asarray(seismometer_list)):
+                try:
+                    inv = read_inventory(filename)
+                    coordinates = inv.get_coordinates(stream[i].id, starttime)
+                    coordinates['location'] = location
+                    # append to lists
+                    coordinates_list.append(coordinates)
+                    seismometer_list.append(coordinates['location'])
+                except:
+                    warnings.filterwarnings('always', category=UserWarning)
+                    warnings.warn(stream[i].stats.channel+' channel not available in '+filename+' in local directory.', category=UserWarning)
+        
+        # calculate distances between each pair of seismometers
+        distances_list = np.zeros((len(coordinates_list), len(coordinates_list)))
+        for i in range(0, len(coordinates_list)):
+            for j in range(i + 1, len(coordinates_list)):
+                distances_list[i][j] = degrees2kilometers(locations2degrees(coordinates_list[i]['latitude'], coordinates_list[i]['longitude'], coordinates_list[j]['latitude'], coordinates_list[j]['longitude']))
+        
+        # calculate maximum distance between closest N seismometers
+        if thr_coincidence_sum == 2:
+            # distance between closest pair
+            return np.min(distances_list[distances_list > 0])
+        elif thr_coincidence_sum < len(coordinates_list) and thr_coincidence_sum <= 5:
+            if thr_coincidence_sum == 3:
+                # distance between closest set of three seismometers
+                distances_matrix = np.zeros((len(coordinates_list), len(coordinates_list), len(coordinates_list)))
+                for i in range(0, len(coordinates_list)):
+                    for j in range(i + 1, len(coordinates_list)):
+                        for k in range(j + 1, len(coordinates_list)):
+                            distances_matrix[i][j][k] = np.max((distances_list[i][j], distances_list[i][k], distances_list[j][k]))
+                return np.min(distances_matrix[distances_matrix > 0])
+            elif thr_coincidence_sum == 4:
+                # distance between closest set of four seismometers
+                distances_matrix = np.zeros((len(coordinates_list), len(coordinates_list), len(coordinates_list), len(coordinates_list)))
+                for i in range(0, len(coordinates_list)):
+                    for j in range(i + 1, len(coordinates_list)):
+                        for k in range(j + 1, len(coordinates_list)):
+                            for l in range(k + 1, len(coordinates_list)):
+                                distances_matrix[i][j][k] = np.max((distances_list[i][j], distances_list[i][k], distances_list[i][l], distances_list[j][k], distances_list[j][l], distances_list[k][l]))
+                return np.min(distances_matrix[distances_matrix > 0])
+            else:
+                # distance between closest set of five seismometers
+                distances_matrix = np.zeros((len(coordinates_list), len(coordinates_list), len(coordinates_list), len(coordinates_list), len(coordinates_list)))
+                for i in range(0, len(coordinates_list)):
+                    for j in range(i + 1, len(coordinates_list)):
+                        for k in range(j + 1, len(coordinates_list)):
+                            for l in range(k + 1, len(coordinates_list)):
+                                for m in range(l + 1, len(coordinates_list)):
+                                    distances_matrix[i][j][k] = np.max((distances_list[i][j], distances_list[i][k], distances_list[i][l], distances_list[i][m], distances_list[j][k], distances_list[j][l], distances_list[j][m], distances_list[k][l], distances_list[k][m], distances_list[l][m]))
+                return np.min(distances_matrix[distances_matrix > 0])
+        else:
+            # too computationally inefficient, so use maximum distance in array
+            return np.max(distances_list)
+
+def __make_catalogues(events, stream, events_list, stream_list, starttime, endtime, signal_type='amplitude', thr_travel_time=0, thr_coincidence_sum=1):
+    
+    ## REFERENCE CATALOGUE
     # output relevant columns to pandas dataframe
-    if len(coincident_events) > 0:
-        events_df = pd.DataFrame(coincident_events)[['time', 'duration']]
+    events_df = pd.DataFrame(columns=['event_id', 'stations', 'network_time', 'ref_time', 'ref_duration', 'ref_amplitude', 'ref_energy'])
+    if len(events) > 0:
+        df = pd.DataFrame(events)[['time', 'duration', 'stations']]
     else:
         raise Exception('Start/end time and stream are for different time periods.')
 
     # remove events outside requested time window and less than 10 times the sampling rate
-    events_df = events_df[np.logical_and(events_df['time'] + events_df['duration'] > starttime, events_df['time'] < endtime)]
-    events_df = events_df[events_df['duration'] > 10./stream[0].stats.sampling_rate]
-    events_df.reset_index(drop=True, inplace=True)
+    df = df[np.logical_and(df['time'] + df['duration'] > starttime, df['time'] < endtime)]
+    df = df[df['duration'] > 10./stream[0].stats.sampling_rate]
+    df.reset_index(drop=True, inplace=True)
+    
+    # add columns with peak amplitude and energy of top N stations, and the event id
+    attributes = get_attributes(df, stream, attribute_summary)
+    for i in range(0, len(df['time'])):
+        event_id = '{:0>4d}'.format(df['time'][i].year)+'{:0>2d}'.format(df['time'][i].month)+'{:0>2d}'.format(df['time'][i].day)+'T'+'{:0>2d}'.format(df['time'][i].hour)+'{:0>2d}'.format(df['time'][i].minute)+'{:0>2d}'.format(df['time'][i].second)+'Z'
+        if thr_coincidence_sum > 1:
+            amplitude = np.mean(np.asarray(attributes['amplitude'][i])[np.argsort(attributes['amplitude'][i])[-thr_coincidence_sum:]])
+            energy = np.mean(np.asarray(attributes['energy'][i])[np.argsort(attributes['energy'][i])[-thr_coincidence_sum:]])
+        else:
+            amplitude = np.mean(attributes['amplitude'][i])
+            energy = np.mean(attributes['energy'][i])
+        events_df.loc[i] = list([event_id, df['stations'][i], thr_travel_time, df['time'][i], df['duration'][i], amplitude, energy])
     
     # add column to store signal_type used in triggering
     if signal_type == 'amplitude':
         events_df['signal_type'] = 'amplitude'
     else:
         events_df['signal_type'] = 'energy'
-
-    return events_df
     
-def __reporting_functions(stream_list, events_list, thr_event_offset):
+    ## TRACE CATALOGUE
+    # find start time and duration of event at each seismometer
+    if isinstance(stream_list, (list, np.ndarray)):
+        traces_df = None
+        k = 0
+        for i in range(0, len(stream_list)):
+            trace_df = pd.DataFrame(columns=['event_id', 'station', 'components', 'time', 'duration'])
+            
+            # create array of components in stream
+            components = []
+            for j in range(0, len(stream_list[i][0].stats.channel)):
+                if int(j - 2) % 3 == 0:
+                    components.append(stream_list[i][0].stats.channel[j - 2:j + 1])
+            
+            df = pd.DataFrame(events_list)[['time', 'duration', 'stations']]
+            df = df[df['stations'] == stream_list[i][0].stats.network+'.'+stream_list[i][0].stats.station+'.'+stream_list[i][0].stats.location]
+            df.reset_index(drop=True, inplace=True)
 
-    # create reporting functions with one everywhere except at events
-    k = 0
-    for i in range(0, len(stream_list)):
-        for j in range(0, len(stream_list[i])):
-            if i == 0 and j == 0:
-                report_stream = Stream(stream_list[0][0].copy())
-                report_stream[0].data = (stream_list[0][0].data)*0.0 + 1
-            else:
-                report_stream += Stream(stream_list[i][j].copy())
-                report_stream[-1].data = (stream_list[i][j].data)*0.0 + 1
-                k = k + 1 # update number of traces
+            l = 0
+            # find all events within range of reference event, including times extending beyond reference event
+            for j in range(0, len(events_df['ref_time'])):
+                index = np.logical_and(df['time'] <= events_df['ref_time'][j] + events_df['ref_duration'][j], df['time'] + df['duration'] >= events_df['ref_time'][j])
+                if np.sum(index) > 0:
+                    trace_df.loc[l] = list([events_df['event_id'][j], df['stations'][0], components, np.min(df['time'][index]), np.max(df['time'][index] + df['duration'][index]) - np.min(df['time'][index])])
+                    l = l + 1
 
-            # add linear functions at times with events
-            if len(events_list) > 0 and isinstance(events_list[0], list):
-                events = events_list[i]
-            else:
-                events = events_list
-            times = np.asarray(report_stream[k].times())
-            for l in range(0, len(events)):
-                # find start and end time of event in seconds from start of stream
-                start_time = float(events[l]['time']) - float(report_stream[k].stats.starttime) - thr_event_offset/2.
-                end_time = float(events[l]['time'] + events[l]['duration']) - float(report_stream[k].stats.starttime) + thr_event_offset/2.
-                # find indices of each event
-                index = np.searchsorted(times, np.arange(start_time, end_time, 1./report_stream[k].stats.sampling_rate))
-                # remove indices outside the range of the stream
-                index = np.delete(index, np.where(index == len(times)))
-                if np.sum(np.where(index == 1)) > 0 and np.sum(np.where(index == 0)) > 0: # keep true zero event
-                    index = np.delete(index, np.where(index == 0))
-                    index = np.append([0], index)
+            # add columns with peak amplitude and energy
+            if len(trace_df) > 0:
+                attributes = get_attributes(trace_df, stream_list[i], attribute_summary)
+                trace_df['amplitude'] = attributes['amplitude']
+                trace_df['energy'] = attributes['energy']
+                
+                # append dataframe for this seismometer to final catalogue
+                if k == 0:
+                    traces_df = trace_df
                 else:
-                    index = np.delete(index, np.where(index == 0))
-                # set these indices to linear function
-                if len(index) > 0:
-                    report_stream[k].data[index] = times[index]/100. + 1
+                    traces_df = traces_df.append(trace_df, ignore_index=True)
+                k = k + 1
     
-    return report_stream
+        # add column to store signal_type used in triggering
+        if signal_type == 'amplitude':
+            traces_df['signal_type'] = 'amplitude'
+        else:
+            traces_df['signal_type'] = 'energy'
+    else:
+        traces_df = events_df
+        # rename columns to match expected format for trace catalogue
+        traces_df.rename(columns = {'ref_time': 'time', 'ref_duration': 'duration', 'ref_amplitude': 'amplitude', 'ref_energy': 'energy'}, inplace = True)
+            
+    return events_df, traces_df
 
 def group_components(component_list, signal_type='amplitude'):
     
@@ -236,12 +325,8 @@ def group_components(component_list, signal_type='amplitude'):
             else:
                 # add additional components to stream in quadrature
                 stream_list[i][0].data += (component_list[i][j].data - mean_list[j])**2
-            
                 # modify trace id to terminate in number of components
-                if stream_list[i][0].id[-1].isnumeric() == True:
-                    stream_list[i][0].id = stream_list[i][0].id[:-1]+str(int(stream_list[i][0].id[-1]) + 1)
-                else:
-                    stream_list[i][0].id = stream_list[i][0].id[:-1]+'2'
+                stream_list[i][0].stats.channel = stream_list[i][0].stats.channel + component_list[i][j].stats.channel
                 
         # if requested output is amplitude convert data to amplitudes
         if signal_type == 'amplitude':
@@ -278,6 +363,10 @@ def plot_events(events, stream, starttime, endtime, filename=None):
 
     warnings.filterwarnings('ignore', category=Warning)
 
+    # catch error if user inputs tuple with event and trace catalogue
+    if isinstance(events, (tuple, list, np.ndarray)):
+        events = events[0] # set as event catalogue by default
+    
     # set start and end time of each calendar day
     start_of_day = UTCDateTime(starttime.year, starttime.month, starttime.day)
     start_time = starttime
@@ -285,10 +374,9 @@ def plot_events(events, stream, starttime, endtime, filename=None):
 
     # create a copy of the input stream separated into streams for each seismometer
     component_list = __group_seismometers(stream)
-    # and with components added in quadrature (i.e. energy); 'amplitude' is very computationally intensive
+    # and with components added in quadrature (i.e. energy)
     stream_list = group_components(component_list, signal_type=events['signal_type'][0])
-    new_stream = stream_list[0]
-    print(new_stream)
+    new_stream = stream_list[0] # first stream in list
 
     # create empty .pdf file
     if filename == None:
@@ -299,8 +387,12 @@ def plot_events(events, stream, starttime, endtime, filename=None):
     # create stream including only times identified as events
     event_stream = Stream()
     for i in range(0, len(events)):
-        event_stream += new_stream.slice(events['time'][i], events['time'][i] + events['duration'][i])
-            
+        try:
+            event_stream += new_stream.slice(events['ref_time'][i], events['ref_time'][i] + events['ref_duration'][i])
+        except:
+            if events['station'][i] == new_stream[0].stats.network+'.'+new_stream[0].stats.station+'.'+new_stream[0].stats.location:
+                event_stream += new_stream.slice(events['time'][i], events['time'][i] + events['duration'][i])
+
     # plot waveform data for each calendar day
     while (start_time < endtime):
         # create plot of waveform data
@@ -349,11 +441,11 @@ def __plot_events(event_stream, stream, start_time, end_time, signal_type='ampli
     # correct axis labels and ticks
     for item in (plt.gca().get_xticklabels() + plt.gca().get_yticklabels()):
         item.set_fontsize(11)
-    plt.xlabel('Time in minutes', fontsize=12)
+    plt.xlabel(r'Time in minutes', fontsize=12)
     if signal_type == 'amplitude':
-        plt.ylabel('Amplitude at '+str(stream[0].stats.station)+' on '+str(start_time.day)+' '+start_time.strftime('%B')+' '+str(start_time.year), fontsize=12, labelpad=6)
+        plt.ylabel(r'Amplitude at '+str(stream[0].stats.station)+' on '+str(start_time.day)+' '+start_time.strftime('%B')+' '+str(start_time.year), fontsize=12, labelpad=6)
     else:
-        plt.ylabel('Energy at '+str(stream[0].stats.station)+' on '+str(start_time.day)+' '+start_time.strftime('%B')+' '+str(start_time.year), fontsize=12, labelpad=6)
+        plt.ylabel(r'Energy at '+str(stream[0].stats.station)+' on '+str(start_time.day)+' '+start_time.strftime('%B')+' '+str(start_time.year), fontsize=12, labelpad=6)
     fig.tight_layout()
 
     return fig
@@ -373,26 +465,46 @@ def __lighten_color(color, alpha=0.25):
 # define functions to calculate attributes of the waveforms
 def get_attributes(events, stream, *attributes):
 
+    # catch error if user inputs tuple with event and trace catalogue
+    if isinstance(events, (tuple, list, np.ndarray)):
+        events = events[0] # set as event catalogue by default
+        
     # create a copy of the input stream separated into streams for each seismometer
     component_list = __group_seismometers(stream)
+    attributes_df = None
 
     # calculate attributes for each event
     for i in range(0, len(events)):
-        # find start and end time of event in seconds from start of stream
-        start_time = UTCDateTime(events['time'][i])
-        end_time = UTCDateTime(events['time'][i] + events['duration'][i])
-        
-        # find mean of attributes if multiple seismometers are used
+        # store list of attributes if multiple seismometers are used
         attribute_list, attribute_List = None, None
-        k = 0
+        
         for j in range(0, len(component_list)):
+            # find start and end time of event in seconds from start of stream
+            try:
+                start_time = UTCDateTime(events['ref_time'][i])
+                end_time = UTCDateTime(events['ref_time'][i] + events['ref_duration'][i])
+                
+                name_list = ['event_id', 'stations', 'network_time', 'ref_time', 'ref_duration']
+                attribute_list = [events['event_id'][i], events['stations'][i], events['network_time'][i], start_time, end_time - start_time]
+            except:
+                start_time = UTCDateTime(events['time'][i])
+                end_time = UTCDateTime(events['time'][i] + events['duration'][i])
+                
+                # only include streams from correct seismometer if using trace catalogue
+                try:
+                    if not events['station'][i] == component_list[j][0].stats.network+'.'+component_list[j][0].stats.station+'.'+component_list[j][0].stats.location:
+                        continue
+                    name_list = ['event_id', 'station', 'components', 'time', 'duration']
+                    attribute_list = [events['event_id'][i], events['station'][i], events['components'][i], start_time, end_time - start_time]
+                except: # this path is used by get_events function
+                    name_list = ['time', 'duration']
+                    attribute_list = [start_time, end_time - start_time]
+                
             # add waveform data during event to new stream
             component_stream = component_list[j].slice(start_time, end_time)
-
+            
             # add attribute names and values to lists
             if len(component_stream) > 0:
-                name_list = ['start_time', 'stop_time']
-                attribute_list = [start_time, end_time]
                 for l in range(0, len(attributes)):
                     name, attribute = attributes[l](component_stream, start_time, end_time)
                     if isinstance(attribute, (list, np.ndarray)):
@@ -402,62 +514,214 @@ def get_attributes(events, stream, *attributes):
                         name_list.append(name)
                         attribute_list.append(attribute)
             
-            # calculate mean of attributes
+            # add attributes from each seismometer to list
             if attribute_List == None:
                 if attribute_list == None:
                     raise Exception('No events found: check event list and stream are for different time periods.')
                 else:
                     attribute_List = attribute_list
-                    k = k + 1
+                    #k = k + 1
             else:
-                attribute_List[2:] = np.asarray(attribute_List[2:])*float(k)/float(k + 1) + np.asarray(attribute_list[2:])/float(k + 1)
-                k = k + 1
+                for k in range(2, len(attribute_List)):
+                    if not isinstance(attribute_List[k], (list, np.ndarray)):
+                        attribute_List[k] = [attribute_List[k]]
+                    attribute_List[k].append(attribute_list[k])
         
         # create pandas dataframe to store attributes
         if i == 0:
             attributes_df = pd.DataFrame(columns=name_list)
         # append attributes for each event to dataframe
-        attributes_df.loc[len(attributes_df)] = attribute_List
+        if not attribute_List == None:
+            attributes_df.loc[len(attributes_df)] = attribute_List
         
     return attributes_df
 
-def attribute_1(component_stream, event_start, event_stop):
-    # Duration
-    return 'attribute_1', event_stop - event_start
+def attribute_summary(component_stream, event_start, event_stop):
+    # Peak amplitude and energy
+    trace = group_components(component_stream.copy(), signal_type='energy')[0][0]
+
+    return ['amplitude', 'energy'], [np.sqrt(np.max(trace.data)), np.sum(trace.data)*component_stream[0].stats.delta]
+
+def waveform_attributes(component_stream, event_start, event_stop):
+    # Bundle of waveform attributes from Provost et al. (2016)
+    name_list, attribute_list = [], []
+    names, attributes = attribute_1(component_stream, event_start, event_stop)
+    name_list.append(names)
+    attribute_list.append(attributes)
+    names, attributes = attribute_2_3(component_stream, event_start, event_stop)
+    name_list.extend(names)
+    attribute_list.extend(attributes)
+    names, attributes = attribute_4(component_stream, event_start, event_stop)
+    name_list.append(names)
+    attribute_list.append(attributes)
+    names, attributes = attribute_5_6(component_stream, event_start, event_stop)
+    name_list.extend(names)
+    attribute_list.extend(attributes)
+    names, attributes = attribute_7_8(component_stream, event_start, event_stop)
+    name_list.extend(names)
+    attribute_list.extend(attributes)
+    names, attributes = attribute_10_11_12(component_stream, event_start, event_stop)
+    name_list.extend(names)
+    attribute_list.extend(attributes)
+    names, attributes = attribute_13_14_15_16_17(component_stream, event_start, event_stop)
+    name_list.extend(names)
+    attribute_list.extend(attributes)
+    names, attributes = attribute_18_19_20_21_22(component_stream, event_start, event_stop)
+    name_list.extend(names)
+    attribute_list.extend(attributes)
     
+    return name_list, attribute_list
+    
+def attribute_1(component_stream, event_start, event_stop):
+    # Duration (log-scale)
+    return 'attribute_1', np.log10(event_stop - event_start)
+
+def attribute_2_3(component_stream, event_start, event_stop):
+    # Ratio of the mean and median over the maximum of the envelop signal (log-scale)
+    trace = group_components(component_stream.copy(), signal_type='amplitude')[0][0]
+    trace_envelope = envelope(trace.data)
+    
+    return ['attribute_2', 'attribute_3'], [np.log10(np.mean(trace_envelope)/np.max(trace_envelope)), np.log10(np.median(trace_envelope)/np.max(trace_envelope))]
+
 def attribute_4(component_stream, event_start, event_stop):
-    # Ratio between ascending and descending time; use only first seismometer in list
-    trace = group_components(component_stream, signal_type='energy')[0][0]
+    # Ratio between ascending and descending time (log-scale)
+    trace = group_components(component_stream.copy(), signal_type='amplitude')[0][0]
     event_max = trace.times()[np.argmax(trace.data)]
 
-    return 'attribute_4', (event_max)/np.maximum(1e-9, (event_stop - event_start) - event_max)
+    return 'attribute_4', np.log10((event_max)/np.maximum(1e-3*event_max, (event_stop - event_start) - event_max)) # cap ratio at 1000
+    
+def attribute_5_6(component_stream, event_start, event_stop):
+    # Kurtosis of the raw signal and envelope (peakness of the signal) (log-scale)
+    trace = group_components(component_stream.copy(), signal_type='amplitude')[0][0]
+    trace_envelope = envelope(trace.data)
+    
+    kurtosis_trace = np.mean(trace.data**4)/(np.mean(trace.data**2))**2 # mean of rectified signal is already zero
+    kurtosis_envelope = np.mean(trace_envelope**4)/(np.mean(trace_envelope**2))**2 # mean of rectified signal is already zero
+
+    return ['attribute_5', 'attribute_6'], [np.log10(kurtosis_trace), np.log10(kurtosis_envelope)]
+    
+def attribute_7_8(component_stream, event_start, event_stop):
+    # Skewness of the raw signal and envelope (log-scale)
+    trace = group_components(component_stream.copy(), signal_type='amplitude')[0][0]
+    trace_envelope = envelope(trace.data)
+    
+    skewness_trace = np.mean(trace.data**3)/(np.mean(trace.data**2))**1.5 # mean of rectified signal is already zero
+    skewness_envelope = np.mean(trace_envelope**3)/(np.mean(trace_envelope**2))**1.5 # mean of rectified signal is already zero
+
+    return ['attribute_7', 'attribute_8'], [np.log10(skewness_trace), np.log10(skewness_envelope)]
     
 def attribute_10_11_12(component_stream, event_start, event_stop):
-    # Energy in the first third and the remaining part of the autocorrelation function; use only first seismometer in list
-    trace = group_components(component_stream, signal_type='energy')[0][0]
+    # Energy in the first third and the remaining part of the autocorrelation function (log-scale)
+    trace = group_components(component_stream.copy(), signal_type='energy')[0][0]
     acf_third = np.sum(correlate(trace, trace, int(len(trace.data)/3))[int(len(trace.data)/3):-1])*trace.stats.delta
     acf_total = np.sum(correlate(trace, trace, int(len(trace.data)))[int(len(trace.data)):-1])*trace.stats.delta
 
-    return ['attribute_10', 'attribute_11', 'attribute_12'], [acf_third, acf_total - acf_third, (acf_total - acf_third)/np.maximum(1e-9, acf_third)]
+    return ['attribute_10', 'attribute_11', 'attribute_12'], [np.log10(acf_third), np.log10(acf_total - acf_third), np.log10((acf_total - acf_third)/np.maximum(1e-3*(acf_total - acf_third), acf_third))] # cap ratio at 1000
     
-def attribute_13_14_15_17(component_stream, event_start, event_stop):
-    # Energy of the signal filtered in 5 – 10 Hz, 10 – 50 Hz, 5 – 70 Hz, 1 - 20 Hz
-    band_13 = np.sum(group_components((component_stream.copy()).filter("bandpass", freqmin=5, freqmax=10), signal_type='energy'))*component_stream[0].stats.delta
-    band_14 = np.sum(group_components((component_stream.copy()).filter("bandpass", freqmin=10, freqmax=50), signal_type='energy'))*component_stream[0].stats.delta
-    band_15 = np.sum(group_components((component_stream.copy()).filter("bandpass", freqmin=5, freqmax=70), signal_type='energy'))*component_stream[0].stats.delta
-    band_17 = np.sum(group_components((component_stream.copy()).filter("bandpass", freqmin=1, freqmax=20), signal_type='energy'))*component_stream[0].stats.delta
+def attribute_13_14_15_16_17(component_stream, event_start, event_stop):
+    # Energy of the signal filtered in 5 – 10 Hz, 10 – 50 Hz, 5 – 70 Hz, 50 - 100 Hz, and 5 - 100 Hz (log-scale)
+    band_13 = np.sum(group_components((component_stream.copy()).filter("bandpass", freqmin=5, freqmax=10), signal_type='energy')[0][0])*component_stream[0].stats.delta
+    band_14 = np.sum(group_components((component_stream.copy()).filter("bandpass", freqmin=10, freqmax=50), signal_type='energy')[0][0])*component_stream[0].stats.delta
+    band_15 = np.sum(group_components((component_stream.copy()).filter("bandpass", freqmin=5, freqmax=70), signal_type='energy')[0][0])*component_stream[0].stats.delta
+    try:
+        band_16 = np.sum(group_components((component_stream.copy()).filter("bandpass", freqmin=50, freqmax=100), signal_type='energy')[0][0])*component_stream[0].stats.delta
+    except:
+        band_16 = 1 # these frequencies are too high for a lot of seismometers
+    band_17 = np.sum(group_components((component_stream.copy()).filter("bandpass", freqmin=5, freqmax=100), signal_type='energy')[0][0])*component_stream[0].stats.delta
     
-    return ['attribute_13', 'attribute_14', 'attribute_15', 'attribute_17'], [band_13, band_14, band_15, band_17]
+    return ['attribute_13', 'attribute_14', 'attribute_15', 'attribute_16', 'attribute_17'], [np.log10(band_13), np.log10(band_14), np.log10(band_15), np.log10(band_16), np.log10(band_17)]
+    
+def attribute_18_19_20_21_22(component_stream, event_start, event_stop):
+    # Kurtosis of the signal in 5 – 10 Hz, 10 – 50 Hz, 5 – 70 Hz, 50 - 100 Hz, and 5 - 100 Hz frequency range (log-scale)
+    band_18 = group_components((component_stream.copy()).filter("bandpass", freqmin=5, freqmax=10), signal_type='amplitude')[0][0].data
+    band_19 = group_components((component_stream.copy()).filter("bandpass", freqmin=10, freqmax=50), signal_type='amplitude')[0][0].data
+    band_20 = group_components((component_stream.copy()).filter("bandpass", freqmin=5, freqmax=70), signal_type='amplitude')[0][0].data
+    try:
+        band_21 = group_components((component_stream.copy()).filter("bandpass", freqmin=50, freqmax=100), signal_type='amplitude')[0][0].data
+    except:
+        band_21 = None # these frequencies are too high for a lot of seismometers
+    band_22 = group_components((component_stream.copy()).filter("bandpass", freqmin=5, freqmax=100), signal_type='amplitude')[0][0].data
+    
+    kurtosis_18 = np.mean(band_18**4)/(np.mean(band_18**2))**2 # mean of rectified signal is already zero
+    kurtosis_19 = np.mean(band_19**4)/(np.mean(band_19**2))**2 # mean of rectified signal is already zero
+    kurtosis_20 = np.mean(band_20**4)/(np.mean(band_20**2))**2 # mean of rectified signal is already zero
+    if band_21 == None:
+        kurtosis_21 = 1
+    else:
+        kurtosis_21 = np.mean(band_21**4)/(np.mean(band_21**2))**2 # mean of rectified signal is already zero
+    kurtosis_22 = np.mean(band_22**4)/(np.mean(band_22**2))**2 # mean of rectified signal is already zero
+    
+    return ['attribute_18', 'attribute_19', 'attribute_20', 'attribute_21', 'attribute_22'], [np.log10(kurtosis_18), np.log10(kurtosis_19), np.log10(kurtosis_20), np.log10(kurtosis_21), np.log10(kurtosis_22)]
 
+def spectral_attributes(component_stream, event_start, event_stop):
+    # Bundle of spectral attributes from Provost et al. (2016)
+    name_list, attribute_list = [], []
+    names, attributes = attribute_24_25_26_27_28_29_30(component_stream, event_start, event_stop)
+    name_list.extend(names)
+    attribute_list.extend(attributes)
+    names, attributes = attribute_34_35_36_37(component_stream, event_start, event_stop)
+    name_list.extend(names)
+    attribute_list.extend(attributes)
+    names, attributes = attribute_38_39_40(component_stream, event_start, event_stop)
+    name_list.extend(names)
+    attribute_list.extend(attributes)
+    
+    return name_list, attribute_list
+    
+def attribute_24_25_26_27_28_29_30(component_stream, event_start, event_stop):
+    # Mean and max of the DFT, frequency at the maximum, central frequency of the 1st and 2nd quartile, and median and variance of the normalized DFT (log-scale)
+    trace = group_components(component_stream.copy(), signal_type='amplitude')[0][0]
+    trace_fft = np.absolute(rfft(trace.data))
+    trace_freq = rfftfreq(len(trace), d=trace.stats.delta)
+    
+    freq_max = trace_freq[np.argmax(trace_fft)]/2. # halve frequency due for rectified amplitude
+    central_27 = np.sum(trace_fft[0:len(trace_fft)//4]*trace_freq[0:len(trace_fft)//4])/np.sum(trace_fft[0:len(trace_fft)//4])
+    central_28 = np.sum(trace_fft[len(trace_fft)//4:len(trace_fft)//2]*trace_freq[len(trace_fft)//4:len(trace_fft)//2])/np.sum(trace_fft[len(trace_fft)//4:len(trace_fft)//2])
+    trace_norm = trace_fft/np.mean(trace_fft) # amplitude of each measurement normalised to 1
+    
+    return ['attribute_24', 'attribute_25', 'attribute_26', 'attribute_27', 'attribute_28', 'attribute_29', 'attribute_30'], [np.log10(np.mean(trace_fft)), np.log10(np.max(trace_fft)), freq_max, np.log10(central_27), np.log10(central_28), np.log10(np.median(trace_norm)), np.log10(np.var(trace_norm))]
+    
+def attribute_34_35_36_37(component_stream, event_start, event_stop):
+    # Energy in [0,1/4]Nyf, [1/4,1/2]Nyf, [1/2,3/4]Nyf, [3/4,1]Nyf (log-scale)
+    trace = group_components(component_stream.copy(), signal_type='amplitude')[0][0]
+    trace_fft = np.absolute(rfft(trace.data))**2 # squared to give energy
+    trace_freq = rfftfreq(len(trace), d=trace.stats.delta)
+    nyquist_freq = trace.stats.sampling_rate/2.
+    
+    band_34 = np.sum(trace_fft[np.logical_and(0 <= trace_freq, trace_freq < nyquist_freq/4.)])*trace.stats.delta
+    band_35 = np.sum(trace_fft[np.logical_and(nyquist_freq/4. <= trace_freq, trace_freq < nyquist_freq/2.)])*trace.stats.delta
+    band_36 = np.sum(trace_fft[np.logical_and(nyquist_freq/2. <= trace_freq, trace_freq < 3*nyquist_freq/4.)])*trace.stats.delta
+    band_37 = np.sum(trace_fft[np.logical_and(3*nyquist_freq/4. <= trace_freq, trace_freq < nyquist_freq)])*trace.stats.delta
+        
+    return ['attribute_34', 'attribute_35', 'attribute_36', 'attribute_37'], [np.log10(band_34), np.log10(band_35), np.log10(band_36), np.log10(band_37)]
+    
+def attribute_38_39_40(component_stream, event_start, event_stop):
+    # Spectral centroid, gyration radius and spectral centroid width
+    trace = group_components(component_stream.copy(), signal_type='amplitude')[0][0]
+    trace_fft = np.absolute(rfft(trace.data))
+    trace_freq = rfftfreq(len(trace), d=trace.stats.delta)
+    
+    gamma1 = np.mean(trace_fft*trace_freq**2)/np.mean(trace_fft*trace_freq)
+    gamma2 = np.sqrt(np.mean(trace_fft*trace_freq**3)/np.mean(trace_fft*trace_freq**2))
+    
+    return ['attribute_38', 'attribute_39', 'attribute_40'], [gamma1, gamma2, np.sqrt(gamma1**2 - gamma2**2)]
+    
+def polarity_attributes(component_stream, event_start, event_stop):
+    # Bundle of polarity attributes from Provost et al. (2016)
+    return attribute_68_69_70_71(component_stream, event_start, event_stop)
+    
 def attribute_68_69_70_71(component_stream, event_start, event_stop):
     # Rectilinearity, azimuth, dip and planarity
-    azimuth, incidence, rectillinearity, planarity = flinn(component_stream)
+    if not len(component_stream) >= 3 or (not component_stream[0].id[-1] == 'Z' or not component_stream[1].id[-1] == 'N' or not component_stream[2].id[-1] == 'E'):
+        raise Exception('Polarity attributes cannot be derived without at least one \'Z\', \'N\' and \'E\' component.')
+    else:
+        azimuth, incidence, rectillinearity, planarity = flinn(component_stream)
 
     return ['attribute_68', 'attribute_69', 'attribute_70', 'attribute_71'], [rectillinearity, azimuth, incidence, planarity]
-
+    
 
 # define functions to plot distribution and correlation between attributes
-def plot_attributes(attributes, attribute_scale=None, filename=None):
+def plot_attributes(attributes, filename=None):
 
     # create new figure
     my_dpi = 150
@@ -474,36 +738,21 @@ def plot_attributes(attributes, attribute_scale=None, filename=None):
     plt.xlim([-5, 5])
         
     attributes = attributes.copy()
-    # determine if any attributes should have logarithmic scaling
-    if not attribute_scale == None:
-        if isinstance(attribute_scale, str):
-            try:
-                if (np.min(attributes[attribute_scale]) > 0):
-                    attributes[attribute_scale] = np.log10(attributes[attribute_scale])
-                else:
-                    print(attribute_scale+' is has non-positive values.')
-            except:
-                print(attribute_scale+' is not an attribute.')
-        else:
-            for i in range(0, len(attribute_scale)):
-                try:
-                    if (np.min(attributes[attribute_scale[i]]) > 0):
-                        attributes[attribute_scale[i]] = np.log10(attributes[attribute_scale[i]])
-                    else:
-                        print(attribute_scale[i]+' is has non-positive values.')
-                except:
-                    print(attribute_scale[i]+' is not an attribute.')
-            
     # scale attributes to gaussian with median of zero and standard deviation corresponding to the 16/84th percentiles
-    for i in range(2, len(attributes.columns)):
+    for i in range(5, len(attributes.columns)):
+        for j in range(0, len(attributes.iloc[:, i])):
+            attributes.iloc[j, i] = np.mean(attributes.iloc[j, i])
         attributes.iloc[:, i] = (attributes.iloc[:, i] - np.quantile(attributes.iloc[:, i], 0.5))/((np.quantile(attributes.iloc[:, i], 0.84) - np.quantile(attributes.iloc[:, i], 0.16))/2.)
         
     # replace non-Latex friendly characters
-    for i in range(2, len(attributes.columns)):
+    for i in range(5, len(attributes.columns)):
         attributes.rename(columns = {attributes.columns[i]:str(attributes.columns[i]).replace('_', '\_')}, inplace=True)
 
     # plot boxplot using seaborn
-    sns.boxplot(data=attributes.drop(columns=['start_time', 'stop_time']), orient='h', ax=plt.gca())
+    try:
+        sns.boxplot(data=attributes.drop(columns=['event_id', 'stations', 'network_time', 'ref_time', 'ref_duration']), orient='h', ax=plt.gca())
+    except:
+        sns.boxplot(data=attributes.drop(columns=['event_id', 'station', 'components', 'time', 'duration']), orient='h', ax=plt.gca())
     plt.tight_layout()
 
     # create .pdf file
@@ -512,7 +761,7 @@ def plot_attributes(attributes, attribute_scale=None, filename=None):
     else:
         plt.savefig(filename+'.pdf')
 
-def plot_correlations(attributes, attribute_scale=None, filename=None):
+def plot_correlations(attributes, filename=None, plot_type='matrix'):
 
     # create new figure
     my_dpi = 150
@@ -525,41 +774,376 @@ def plot_correlations(attributes, attribute_scale=None, filename=None):
     rc('font', **{'family': 'serif', 'serif': ['Computer Modern']})
 
     attributes = attributes.copy()
-    # determine if any attributes should have logarithmic scaling
-    if not attribute_scale == None:
-        if isinstance(attribute_scale, str):
-            try:
-                if (np.min(attributes[attribute_scale]) > 0):
-                    attributes[attribute_scale] = np.log10(attributes[attribute_scale])
-                else:
-                    print(attribute_scale+' is has non-positive values.')
-            except:
-                print(attribute_scale+' is not an attribute.')
-        else:
-            for i in range(0, len(attribute_scale)):
-                try:
-                    if (np.min(attributes[attribute_scale[i]]) > 0):
-                        attributes[attribute_scale[i]] = np.log10(attributes[attribute_scale[i]])
-                    else:
-                        print(attribute_scale[i]+' is has non-positive values.')
-                except:
-                    print(attribute_scale[i]+' is not an attribute.')
-
     # replace non-Latex friendly characters
-    for i in range(2, len(attributes.columns)):
+    for i in range(5, len(attributes.columns)):
+        for j in range(0, len(attributes.iloc[:, i])):
+            attributes.iloc[j, i] = np.mean(attributes.iloc[j, i])
+        attributes.iloc[:, i] = pd.to_numeric(attributes.iloc[:, i], downcast='float')
         attributes.rename(columns = {attributes.columns[i]:str(attributes.columns[i]).replace('_', '\_')}, inplace=True)
+
+    if plot_type == 'matrix':
+        # create correlation matrix and mask for upper triangular matrix
+        try:
+            corrMatt = attributes.drop(columns=['event_id', 'stations', 'network_time', 'ref_time', 'ref_duration']).corr()
+        except:
+            corrMatt = attributes.drop(columns=['event_id', 'station', 'components', 'time', 'duration']).corr()
+        mask = np.array(corrMatt)
+        mask[np.tril_indices_from(mask)] = False
         
-    # create correlation matrix and mask for upper triangular matrix
-    corrMatt = attributes.drop(columns=['start_time', 'stop_time']).corr()
-    mask = np.array(corrMatt)
-    mask[np.tril_indices_from(mask)] = False
-
-    # create correlation plot
-    sns.heatmap(corrMatt, mask=mask, vmin=-1, vmax=1, square=True, annot=True, annot_kws={'size': 9}, fmt='.2f', cbar=False)
-    plt.tight_layout()
-
+        # create correlation plot
+        sns.heatmap(corrMatt, mask=mask, vmin=-1, vmax=1, square=True, annot=True, annot_kws={'size': 9}, fmt='.2f', cbar=False)
+        plt.tight_layout()
+    else:
+        warnings.filterwarnings('ignore', category=Warning)
+        rc('font', size=0) # stop text from resizing plots
+        
+        # create pair plot
+        try:
+            pairs = attributes.drop(columns=['event_id', 'stations', 'network_time', 'ref_time', 'ref_duration'])
+        except:
+            pairs = attributes.drop(columns=['event_id', 'station', 'components', 'time', 'duration'])
+        
+        for i in range(0, 2):
+            pd.plotting.scatter_matrix(pairs, ax=plt.gca(), c='crimson', hist_kwds={'bins': 10, 'color': 'black', 'alpha': 0.65})
+            allaxes = fig.get_axes()
+            # remove tickmarks
+            for ax in allaxes:
+                ax.set_xticklabels([])
+                ax.set_yticklabels([])
+                ax.set_xticks([])
+                ax.set_yticks([])
+                ax.set_xlabel(ax.get_xlabel(), rotation=90, fontsize=12)
+                ax.set_ylabel(ax.get_ylabel(), rotation=0, horizontalalignment='right', verticalalignment='center', fontsize=12)
+            # find location of bottom left plot in tight layout (doubles computation time)
+            if i == 0:
+                plt.tight_layout()
+                left, bottom = 1, 1
+                for ax in allaxes:
+                    pos = ax.get_position()
+                    if pos.x0 < left:
+                        left = pos.x0
+                    if pos.y0 < bottom:
+                        bottom = pos.y0
+                plt.cla()
+            # remove upper triangular matrix
+            if i == 1:
+                j = 0
+                sqrt = np.sqrt(len(allaxes))
+                for ax in allaxes:
+                    if j%sqrt > j//sqrt:
+                        ax.cla()
+                        ax.axis('off')
+                    j = j + 1
+        # resize plot to fit window
+        plt.subplots_adjust(left=left, bottom=bottom, right=1, top=1, wspace=None, hspace=None)
+        
     # create .pdf file
     if filename == None:
-        plt.savefig('correlation_plot.pdf')
+        if plot_type == 'matrix':
+            plt.savefig('correlation_matrix.pdf')
+        else:
+            plt.savefig('corner_plot.pdf')
     else:
         plt.savefig(filename+'.pdf')
+        
+
+# define function to plot waveforms from trace database
+def plot_waveforms(events, event_id, start_buffer=10, end_buffer=30, filename=None, waveform_name='waveforms', station_name='stations', client=['IRIS', 'LMU', 'GFZ'], download=True):
+    
+    # create new figure object for single day plot
+    my_dpi = 150
+    fig = plt.figure(figsize=(7.5, 6.5), dpi=my_dpi)
+
+    # set font sizes and use of Latex fonts
+    rc('text', usetex=True)
+    rc('font', size=12)
+    rc('legend', fontsize=10)
+    rc('font', **{'family': 'serif', 'serif': ['Computer Modern']})
+    
+    # define colour scheme
+    colormap = cm.get_cmap('ocean_r', 256)
+    new_colormap = ListedColormap(colormap(np.linspace(0.5, 1, 256)))
+        
+    # catch error if user inputs tuple with event and trace catalogue
+    if isinstance(events, (tuple, list, np.ndarray)):
+        events = events[1] # set as trace catalogue by default
+    try:
+        a, b = events['station'], events['components']
+    except:
+        raise Exception('Input the trace catalogue of events or attributes, not the reference event catalogue.')
+
+    # create copy of event catalogue and extract relevant waveforms
+    events_df = events.loc[events['event_id'] == event_id].reset_index(drop=True)
+    
+    # download waveform data for each seismometer and channel
+    stream_list = []
+    channel_list = []
+    x_min, x_max, y_min, y_max = 1e99, -1e99, 1e99, -1e99
+    for i in range(0, len(events_df)):
+        event = events_df.loc[i]
+        # only plot seismometers with the same channels as the first seismometer
+        if i == 0 or np.array_equal(event['components'], channel_list):
+            channel_list = event['components']
+            stream = get_waveforms(event['station'].split(".")[0], event['station'].split(".")[1], event['station'].split(".")[2], event['components'], event['time'] - start_buffer, event['time'] + event['duration'] + end_buffer, event_buffer=0, waveform_name=waveform_name, station_name=station_name, client=client, download=download)
+            stream_list.append(stream)
+            # find domain and range of traces
+            for trace in stream:
+                if event['time'] - start_buffer < x_min:
+                    x_min = event['time'] - start_buffer
+                if event['time'] + event['duration'] + end_buffer > x_max:
+                    x_max = event['time'] + event['duration'] + end_buffer
+                if np.min(trace.data) < y_min:
+                    y_min = np.min(trace.data)
+                if np.max(trace.data) > y_max:
+                    y_max = np.max(trace.data)
+        else:
+            msg = "The channels in at least one seismometer differ from those at the other sites (%s)" % event['station']
+            warnings.filterwarnings('always', category=UserWarning)
+            warnings.warn(msg, UserWarning)
+    
+    for i in range(0, 2):
+        # plot waveforms
+        trace_id = []
+        for j in range(0, len(stream_list)):
+            if j%2 == 0:
+                linestyle = '-'
+            else:
+                linestyle = '--'
+            channels = []
+            for trace in stream_list[j]:
+                channels.append(trace.id)
+                # modify names to display only channel
+                if i == 1:
+                    trace.id = '...'+trace.id.split(".")[3]
+            trace_id.append(channels)
+            warnings.filterwarnings('ignore', category=Warning)
+            if len(events_df) > 1:
+                stream_list[j].plot(fig=fig, color=new_colormap(j/(len(events_df) - 1)), linewidth=0.75, linestyle=linestyle)
+            else:
+                stream_list[j].plot(fig=fig, color=new_colormap(0), linewidth=0.75, linestyle=linestyle)
+
+        # modify axes limits
+        allaxes = fig.get_axes()
+        for ax in allaxes:
+            ax.set_xlim([datetime.datetime.fromtimestamp(x_min.timestamp, pytz.UTC), datetime.datetime.fromtimestamp(x_max.timestamp, pytz.UTC)])
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
+            ax.set_ylim([y_min - 0.05*(y_max - y_min), y_max + 0.05*(y_max - y_min)])
+        
+        # add legend labels for each seismometer
+        for j in range(0, len(stream_list)):
+            if j%2 == 0:
+                linestyle = '-'
+            else:
+                linestyle = '--'
+            if len(events_df) > 1:
+                allaxes[0].plot(0, 0, color=new_colormap(j/(len(events_df) - 1)), linewidth=0.75, linestyle=linestyle, label=trace_id[j][0].split(".")[0]+'.'+trace_id[j][0].split(".")[1]+'.'+trace_id[j][0].split(".")[2])
+            else:
+                 allaxes[0].plot(0, 0, color=new_colormap(0), linewidth=0.75, linestyle=linestyle, label=trace_id[j][0].split(".")[0]+'.'+trace_id[j][0].split(".")[1]+'.'+trace_id[j][0].split(".")[2])
+        if len(stream_list) > 8:
+            allaxes[0].legend(fontsize = 8, loc='upper right')
+        else:
+            allaxes[0].legend(fontsize = 10, loc='upper right')
+        plt.title('')
+        
+        # add axes labels
+        plt.xlabel(r'UTC Time on '+str(x_min.day)+' '+x_min.strftime('%B')+' '+str(x_min.year), fontsize=12)
+        
+        # find location of bottom left and top right plot in tight layout (doubles computation time)
+        if i == 0:
+            plt.tight_layout()
+            left, bottom, right, top = 1, 1, 0, 0
+            for ax in allaxes:
+                pos = ax.get_position()
+                if pos.x0 < left:
+                    left = pos.x0
+                if pos.y0 < bottom:
+                    bottom = pos.y0
+                if pos.x1 > right:
+                    right = pos.x1
+                if pos.y1 > top:
+                    top = pos.y1
+                ax.cla()
+        if i == 1:
+            plt.subplots_adjust(left=left, bottom=bottom, right=right, top=top, wspace=None, hspace=None)
+    
+    # create .pdf file
+    if filename == None:
+        plt.savefig(event_id+'_plot.pdf')
+    else:
+        plt.savefig(filename+'.pdf')
+        
+        
+# define heavily modified coincidence_trigger function that creates trace and event catalogues
+def __coincidence_trigger(trigger_type, thr_on, thr_off, stream, nseismometers, thr_travel_time=0, thr_event_join=10, thr_coincidence_sum=1, trigger_off_extension=60, **options):
+
+    st = stream.copy()
+    # use all traces ids found in stream
+    trace_ids = [tr.id for tr in st]
+    # we always work with a dictionary with trace ids and their weights later
+    if isinstance(trace_ids, list) or isinstance(trace_ids, tuple):
+        trace_ids = dict.fromkeys(trace_ids, 1)
+
+    # the single station triggering
+    triggers = []
+    single_triggers = []
+    # prepare kwargs for trigger_onset
+    kwargs = {'max_len_delete': False}
+    for tr in st:
+        if tr.id not in trace_ids:
+            msg = "At least one trace's ID was not found in the " + \
+                  "trace ID list and was disregarded (%s)" % tr.id
+            warnings.warn(msg, UserWarning)
+            continue
+        if trigger_type is not None:
+            tr.trigger(trigger_type, **options)
+        max_trigger_length = 1e6
+        kwargs['max_len'] = int(
+            max_trigger_length * tr.stats.sampling_rate + 0.5)
+        tmp_triggers = trigger_onset(tr.data, thr_on, thr_off, **kwargs)
+        # find triggers for given station
+        prv_on, prv_off = -1000, -1000
+        for on, off in tmp_triggers:
+            on = tr.stats.starttime + float(on) / tr.stats.sampling_rate
+            off = tr.stats.starttime + float(off) / tr.stats.sampling_rate
+            # extend previous event if only small gap
+            if prv_on < 0:
+                # update on and off times for first event
+                prv_on = on
+                prv_off = off
+            elif on <= prv_off + thr_event_join:
+                # update off time assuming continuing event
+                prv_off = off
+            else:
+                # add previous trigger to catalogue
+                triggers.append([prv_on.timestamp, prv_off.timestamp, tr.id])
+                # add trigger to trace catalogue
+                event = {}
+                event['time'] = UTCDateTime(prv_on)
+                event['stations'] = (tr.id).split(".")[0]+'.'+(tr.id).split(".")[1]+'.'+(tr.id).split(".")[2]
+                event['trace_ids'] = tr.id
+                event['coincidence_sum'] = 1.0
+                event['duration'] = prv_off - prv_on
+                single_triggers.append(event)
+                # update on and off times
+                prv_on = on
+                prv_off = off
+        # add final trigger to catalogue
+        if prv_on > 0:
+            triggers.append([prv_on.timestamp, prv_off.timestamp, tr.id])
+            # add trigger to event catalogue
+            event = {}
+            event['time'] = UTCDateTime(prv_on)
+            event['stations'] = (tr.id).split(".")[0]+'.'+(tr.id).split(".")[1]+'.'+(tr.id).split(".")[2]
+            event['trace_ids'] = tr.id
+            event['coincidence_sum'] = 1.0
+            event['duration'] = prv_off - prv_on
+            single_triggers.append(event)
+    triggers.sort()
+
+    # the coincidence triggering and coincidence sum computation
+    coincidence_triggers = []
+    last_off_time = [0.0]
+    while triggers != []:
+        # remove first trigger from list and look for overlaps
+        on, off, tr_id = triggers.pop(0)
+        on = on - thr_travel_time
+        sta = (tr.id).split(".")[0]+'.'+(tr.id).split(".")[1]+'.'+(tr.id).split(".")[2]
+        # add trigger to event catalogue
+        event = {}
+        event['time'] = [UTCDateTime(on)]
+        event['off_time'] = [UTCDateTime(off)]
+        event['stations'] = [tr_id.split(".")[0]+'.'+tr_id.split(".")[1]+'.'+tr_id.split(".")[2]]
+        event['trace_ids'] = [tr_id]
+        # compile the list of stations that overlap with the current trigger
+        k = 0
+        for trigger in triggers:
+            tmp_on, tmp_off, tmp_tr_id = trigger
+            tmp_sta = (tmp_tr_id).split(".")[0]+'.'+(tmp_tr_id).split(".")[1]+'.'+(tmp_tr_id).split(".")[2]
+            if np.any(tmp_sta == np.asarray(event['stations'])):
+                pass # station already included so do not add travel time again
+            else:
+                tmp_on = tmp_on - thr_travel_time
+            # break if there is a gap in between the two triggers
+            if tmp_on > off + trigger_off_extension or k >= 3*nseismometers: # place limit on number of triggers; must be within a small time of the last trigger and up to 3N triggers in total
+                break
+            event['time'].append(UTCDateTime(tmp_on))
+            event['off_time'].append(UTCDateTime(tmp_off))
+            event['stations'].append(tmp_sta)
+            event['trace_ids'].append(tmp_tr_id)
+            # allow sets of triggers that overlap only on subsets of all stations (e.g. A overlaps with B and B overlaps w/ C => ABC)
+            off = max(off, tmp_off)
+            k = k + 1
+        
+        # find on and off time of first region with multiple triggers
+        trigger_times = event['time'] + event['off_time']
+        trigger_stations = event['stations'] + event['stations']
+        trigger_traces = event['trace_ids'] + event['trace_ids']
+        trigger_sum = np.asarray([1]*len(event['time']) + [-1]*len(event['off_time']))
+        index = np.argsort(trigger_times.copy())
+        # initialise variables
+        coincidence_sum, event['coincidence_sum'], join_time = 0, 0, None
+        event['stations'], event['trace_ids'] = [], []
+        for i in range(0, len(index)):
+            coincidence_sum = coincidence_sum + trigger_sum[index[i]]
+            # coincidence sum region
+            if coincidence_sum >= thr_coincidence_sum:
+                # set start time if over threshold for the first time
+                if isinstance(event['time'], list):
+                    event['time'] = trigger_times[index[i]]
+                # update end time
+                event['off_time'] = trigger_times[index[i]]
+                event['duration'] = event['off_time'] - event['time']
+                # update maximum coincidence sum for detection
+                event['coincidence_sum'] = max(coincidence_sum, event['coincidence_sum'])
+                # add station and trace_id to event catalogue
+                if trigger_sum[index[i]] > 0:
+                    event['stations'].append(trigger_stations[index[i]])
+                    event['trace_ids'].append(trigger_traces[index[i]])
+                # reset join time if coincidence trigger condition met again
+                join_time = None
+            else:
+                # before coincidence sum region
+                if isinstance(event['time'], list):
+                    # add station and trace_id to event catalogue and remove if it detriggers before coincidence sum region
+                    if trigger_sum[index[i]] > 0:
+                        event['stations'].append(trigger_stations[index[i]])
+                        event['trace_ids'].append(trigger_traces[index[i]])
+                    else:
+                        event['stations'].remove(trigger_stations[index[i]])
+                        event['trace_ids'].remove(trigger_traces[index[i]])
+                # after coincidence sum region
+                else:
+                    # update end time
+                    event['off_time'] = trigger_times[index[i]]
+                    event['duration'] = event['off_time'] - event['time']
+                    if join_time == None:
+                        join_time = event['off_time']
+                    elif (event['off_time'] - join_time) > thr_event_join or coincidence_sum < 1:
+                        # only join if at least one seismometer active
+                        break
+        # update end time and duration in case coincidence trigger did not join events
+        if not join_time == None:
+            event['off_time'] = join_time
+            event['duration'] = join_time - event['time']
+                    
+        # remove duplicate stations and trace_ids (as applicable)
+        event['stations'] = list(dict.fromkeys(event['stations']))
+        event['trace_ids'] = list(dict.fromkeys(event['trace_ids']))
+
+        # skip if both coincidence sum and similarity thresholds are not met
+        if event['coincidence_sum'] < thr_coincidence_sum:
+            continue
+        # skip coincidence trigger if it is just a subset of the previous (determined by a shared off-time, this is a bit sloppy)
+        if np.any(np.asarray(last_off_time) - float(event['off_time']) >= 0):
+            continue
+        
+        # add event to catalogue and center times
+        event['time'], event['off_time'] = event['time'] + thr_travel_time/2., event['off_time'] + thr_travel_time/2.
+        coincidence_triggers.append(event)
+        last_off_time.append(event['off_time'])
+    
+    # remove keys used in computation only
+    for trigger in coincidence_triggers:
+        trigger.pop('off_time')
+
+    return single_triggers, coincidence_triggers
