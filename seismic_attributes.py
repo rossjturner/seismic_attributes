@@ -177,7 +177,7 @@ def __get_distances(stream, starttime, station_name='stations', thr_coincidence_
             for j in range(i + 1, len(coordinates_list)):
                 distances_list[i][j] = degrees2kilometers(locations2degrees(coordinates_list[i]['latitude'], coordinates_list[i]['longitude'], coordinates_list[j]['latitude'], coordinates_list[j]['longitude']))
         
-        # calculate maximum distance between closest N seismometers
+        # calculate maximum distance between closest n seismometers
         if thr_coincidence_sum == 2:
             # distance between closest pair
             return np.min(distances_list[distances_list > 0])
