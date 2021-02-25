@@ -1,5 +1,5 @@
 # seismic_attributes module
-# Ross Turner, 25 September 2020
+# Ross Turner, 16 January 2021
 
 # import packages
 import numpy as np
@@ -12,25 +12,24 @@ import seaborn as sns
 from functools import partial
 from math import factorial
 from obspy import read, read_inventory, Trace, Stream, UTCDateTime
+from obspy.clients.fdsn import Client
 from obspy.clients.fdsn.mass_downloader import RectangularDomain, Restrictions, MassDownloader
 from obspy.geodetics import locations2degrees, degrees2kilometers
 from obspy.signal.trigger import trigger_onset
 from obspy.signal.cross_correlation import correlate
 from obspy.signal.polarization import flinn
-#from obspy.signal.freqattributes import spectrum
 from obspy.signal.filter import envelope
 from matplotlib import cm, rc
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.colors import ListedColormap,LinearSegmentedColormap
 from multiprocessing import cpu_count, Pool
 from numpy.fft import rfft, rfftfreq
-#from pandas.plotting import scatter_matrix
 
 # define constants
 __chunklength_in_sec = 86400
 
-## define functions to download or find already downloaded waveforms
-def get_waveforms(network, station, location, channel, starttime, endtime, event_buffer=3600, waveform_name='waveforms', station_name='stations', client=['IRIS', 'LMU', 'GFZ'], download=True):
+# define functions to download or find already downloaded waveforms
+def get_waveforms(network, station, location, channel, starttime, endtime, event_buffer=3600, waveform_name='waveforms', station_name='stations', providers=['IRIS', 'LMU', 'GFZ'], user=None, password=None, download=True):
         
     # create empty stream to store amplitude of three component waveform
     stream = Stream()
@@ -39,11 +38,11 @@ def get_waveforms(network, station, location, channel, starttime, endtime, event
     if isinstance(channel, list):
         for i in range(0, len(channel)):
             if i == 0:
-                stream = __get_waveforms(network, station, location, channel[0], starttime - event_buffer, endtime + event_buffer, waveform_name=waveform_name, station_name=station_name, provider=client, download=download)
+                stream = __get_waveforms(network, station, location, channel[0], starttime - event_buffer, endtime + event_buffer, waveform_name=waveform_name, station_name=station_name, providers=providers, user=user, password=password, download=download)
             else:
-                stream += __get_waveforms(network, station, location, channel[i], starttime - event_buffer, endtime + event_buffer, waveform_name=waveform_name, station_name=station_name, provider=client, download=download)
+                stream += __get_waveforms(network, station, location, channel[i], starttime - event_buffer, endtime + event_buffer, waveform_name=waveform_name, station_name=station_name, providers=providers, user=user, password=password, download=download)
     else:
-        stream = __get_waveforms(network, station, location, channel, starttime - event_buffer, endtime + event_buffer, waveform_name=waveform_name, station_name=station_name, provider=client, download=download)
+        stream = __get_waveforms(network, station, location, channel, starttime - event_buffer, endtime + event_buffer, waveform_name=waveform_name, station_name=station_name, providers=providers, user=user, password=password, download=download)
 
     # merge different days in the stream at the same seismograph and channel; this prevents masked arrays from being created
     stream.merge(method=0, fill_value='interpolate')
@@ -55,12 +54,14 @@ def get_waveforms(network, station, location, channel, starttime, endtime, event
     # check all traces are the same length and start at the same time
     for i in range(0, len(stream)):
         if not (stream[i].stats.starttime == stream[0].stats.starttime and len(stream[i].data) == len(stream[0].data)):
-            raise Exception('Stream has one or more components with inconsistent start and end times! Download the data again if it exists or select a valid time period.')
+            warnings.filterwarnings('always', category=UserWarning)
+            warnings.warn('Stream has one or more components with inconsistent start and end times! Download the data again if it exists or select a valid time period.', category=UserWarning)
+            warnings.filterwarnings('ignore', category=Warning)
 
     print(stream)
     return stream
 
-def __get_waveforms(network, station, location, channel, t1, t2, waveform_name='waveforms', station_name='stations', provider=['IRIS', 'LMU', 'GFZ'], download=True):
+def __get_waveforms(network, station, location, channel, t1, t2, waveform_name='waveforms', station_name='stations', providers=['IRIS', 'LMU', 'GFZ'], user=None, password=None, download=True):
 
     # create empty stream to store waveform
     stream = Stream()
@@ -79,7 +80,7 @@ def __get_waveforms(network, station, location, channel, t1, t2, waveform_name='
         # otherwise attempt to download file then read-in if data exists
         else:
             if download == True:
-                __download_waveforms(network, station, location, channel, start_time, end_time, waveform_name=waveform_name, station_name=station_name, provider=provider)
+                __download_waveforms(network, station, location, channel, start_time, end_time, waveform_name=waveform_name, station_name=station_name, providers=providers, user=user, password=password)
                 if os.path.isfile(filename):
                     stream += read(filename)
             else:
@@ -94,7 +95,7 @@ def __get_waveforms(network, station, location, channel, t1, t2, waveform_name='
             
     return stream
 
-def __download_waveforms(network, station, location, channel, t1, t2, waveform_name='waveforms', station_name='stations', provider=['IRIS', 'LMU', 'GFZ']):
+def __download_waveforms(network, station, location, channel, t1, t2, waveform_name='waveforms', station_name='stations', providers=['IRIS', 'LMU', 'GFZ'], user=None, password=None):
 
     # specify rectangular domain containing any location in the world.
     domain = RectangularDomain(minlatitude=-90, maxlatitude=90, minlongitude=-180, maxlongitude=180)
@@ -110,11 +111,20 @@ def __download_waveforms(network, station, location, channel, t1, t2, waveform_n
         minimum_interstation_distance_in_m=100.0)
 
     # download requested waveform and station data to specified locations
-    if isinstance(provider, list):
-        mdl = MassDownloader(providers=provider)
+    if isinstance(providers, list):
+        if (not user == None) and (not password == None):
+            client = []
+            for provider in providers:
+                client.append(Client(provider, user=user, password=password))
+            mdl = MassDownloader(providers=client)
+        else:
+            mdl = MassDownloader(providers=providers)
     else:
-        mdl = MassDownloader(providers=[provider])
-    mdl.download(domain, restrictions, mseed_storage=waveform_name, stationxml_storage=station_name)
+        if (not user == None) and (not password == None):
+            mdl = MassDownloader(providers=[Client(providers, user=user, password=password)])
+        else:
+            mdl = MassDownloader(providers=[providers])
+    mdl.download(domain, restrictions, mseed_storage=waveform_name, stationxml_storage=station_name+'/{network}.{station}.'+location+'.'+channel+'.xml')
 
 
 # define functions to find events in a single seismometer or coincident events across multiple seismometers based on the quadrature sum of their components
@@ -159,12 +169,12 @@ def __get_distances(stream, starttime, station_name='stations', thr_coincidence_
         
         # find coordinates of each unique seismometer, excluding channels
         for i in range(0, len(stream)):
-            filename = station_name+'/'+stream[i].stats.network+'.'+stream[i].stats.station+'.xml'
+            filename = station_name+'/'+stream[i].stats.network+'.'+stream[i].stats.station+'.'+stream[i].stats.location+'.'+stream[i].stats.channel+'.xml'
             location = stream[i].stats.network+'.'+stream[i].stats.station+'.'+stream[i].stats.location
             if i == 0 or not np.any(location == np.asarray(seismometer_list)):
                 try:
                     inv = read_inventory(filename)
-                    coordinates = inv.get_coordinates(stream[i].id, starttime)
+                    coordinates = inv.get_coordinates(stream[i].id, stream[i].stats.starttime)
                     coordinates['location'] = location
                     # append to lists
                     coordinates_list.append(coordinates)
@@ -179,7 +189,7 @@ def __get_distances(stream, starttime, station_name='stations', thr_coincidence_
             for j in range(i + 1, len(coordinates_list)):
                 distances_list[i][j] = degrees2kilometers(locations2degrees(coordinates_list[i]['latitude'], coordinates_list[i]['longitude'], coordinates_list[j]['latitude'], coordinates_list[j]['longitude']))
         
-        # calculate maximum distance between closest N seismometers
+        # calculate maximum distance between closest n seismometers
         if thr_coincidence_sum == 2:
             # distance between closest pair
             return np.min(distances_list[distances_list > 0])
@@ -310,23 +320,30 @@ def group_components(component_list, signal_type='amplitude'):
     
     # combine traces at each seismometer in quadrature as appropriate
     for i in range(0, len(component_list)):
-        # find mean of each component at the given seismometer
-        mean_list = []
-        # calculate weighted mean for the seismometer and component in this trace
+        # find latest start time and earlest stop time across the compenents at the given seismometer
+        starttime, endtime = 0, 1e99
         for j in range(0, len(component_list[i])):
-            count = len(component_list[i][j].data)
-            mean = np.sum(component_list[i][j].data)
+            if component_list[i][j].stats.starttime > starttime:
+                starttime = component_list[i][j].stats.starttime
+            if component_list[i][j].stats.endtime < endtime:
+                endtime = component_list[i][j].stats.endtime
+                
+        # find weighted mean for the seismometer and component in this trace
+        mean_list = []
+        for j in range(0, len(component_list[i])):
+            count = len(component_list[i][j].slice(starttime, endtime).data)
+            mean = np.sum(component_list[i][j].slice(starttime, endtime).data)
             mean_list.append(float(mean)/count)
     
         for j in range(0, len(component_list[i])):
             # create new stream object to store combined components
             if j == 0:
-                new_stream = Stream(component_list[i][0].copy())
-                new_stream[0].data = (component_list[i][0].data - mean_list[0])**2
+                new_stream = Stream(component_list[i][0].slice(starttime, endtime))
+                new_stream[0].data = (component_list[i][0].slice(starttime, endtime).data - mean_list[0])**2
                 stream_list.append(new_stream)
             else:
                 # add additional components to stream in quadrature
-                stream_list[i][0].data += (component_list[i][j].data - mean_list[j])**2
+                stream_list[i][0].data += (component_list[i][j].slice(starttime, endtime).data - mean_list[j])**2
                 # modify trace id to terminate in number of components
                 stream_list[i][0].stats.channel = stream_list[i][0].stats.channel + component_list[i][j].stats.channel
                 
@@ -653,7 +670,7 @@ def attribute_18_19_20_21_22(component_stream, event_start, event_stop):
     kurtosis_18 = np.mean(band_18**4)/(np.mean(band_18**2))**2 # mean of rectified signal is already zero
     kurtosis_19 = np.mean(band_19**4)/(np.mean(band_19**2))**2 # mean of rectified signal is already zero
     kurtosis_20 = np.mean(band_20**4)/(np.mean(band_20**2))**2 # mean of rectified signal is already zero
-    if band_21 == None:
+    if not isinstance(band_21, (list, np.ndarray)) and band_21 == None:
         kurtosis_21 = 1
     else:
         kurtosis_21 = np.mean(band_21**4)/(np.mean(band_21**2))**2 # mean of rectified signal is already zero
@@ -723,7 +740,10 @@ def attribute_68_69_70_71(component_stream, event_start, event_stop):
     if not len(component_stream) >= 3 or (not component_stream[0].id[-1] == 'Z' or not component_stream[1].id[-1] == 'N' or not component_stream[2].id[-1] == 'E'):
         raise Exception('Polarity attributes cannot be derived without at least one \'Z\', \'N\' and \'E\' component.')
     else:
-        azimuth, incidence, rectillinearity, planarity = flinn(component_stream)
+        try:
+            azimuth, incidence, rectillinearity, planarity = flinn(component_stream)
+        except:
+            azimuth, incidence, rectillinearity, planarity = np.nan, np.nan, np.nan, np.nan
 
     return ['attribute_68', 'attribute_69', 'attribute_70', 'attribute_71'], [rectillinearity, azimuth, incidence, planarity]
     
