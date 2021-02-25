@@ -467,6 +467,9 @@ def __lighten_color(color, alpha=0.25):
 # define functions to calculate attributes of the waveforms
 def get_attributes(events, stream, *attributes):
 
+    # variable to check if first event has been found
+    first_event = 0
+
     # catch error if user inputs tuple with event and trace catalogue
     if isinstance(events, (tuple, list, np.ndarray)):
         events = events[0] # set as event catalogue by default
@@ -484,13 +487,14 @@ def get_attributes(events, stream, *attributes):
             # find start and end time of event in seconds from start of stream
             try:
                 start_time = UTCDateTime(events['ref_time'][i])
-                end_time = UTCDateTime(events['ref_time'][i] + events['ref_duration'][i])
+                end_time = UTCDateTime(events['ref_time'][i]) + events['ref_duration'][i]
                 
                 name_list = ['event_id', 'stations', 'network_time', 'ref_time', 'ref_duration']
                 attribute_list = [events['event_id'][i], events['stations'][i], events['network_time'][i], start_time, end_time - start_time]
+                first_event = first_event + 1
             except:
                 start_time = UTCDateTime(events['time'][i])
-                end_time = UTCDateTime(events['time'][i] + events['duration'][i])
+                end_time = UTCDateTime(events['time'][i]) + events['duration'][i]
                 
                 # only include streams from correct seismometer if using trace catalogue
                 try:
@@ -498,9 +502,11 @@ def get_attributes(events, stream, *attributes):
                         continue
                     name_list = ['event_id', 'station', 'components', 'time', 'duration']
                     attribute_list = [events['event_id'][i], events['station'][i], events['components'][i], start_time, end_time - start_time]
+                    first_event = first_event + 1
                 except: # this path is used by get_events function
                     name_list = ['time', 'duration']
                     attribute_list = [start_time, end_time - start_time]
+                    first_event = first_event + 1
                 
             # add waveform data during event to new stream
             component_stream = component_list[j].slice(start_time, end_time)
@@ -530,10 +536,10 @@ def get_attributes(events, stream, *attributes):
                     attribute_List[k].append(attribute_list[k])
         
         # create pandas dataframe to store attributes
-        if i == 0:
+        if first_event == 1:
             attributes_df = pd.DataFrame(columns=name_list)
         # append attributes for each event to dataframe
-        if not attribute_List == None:
+        if first_event >= 1 and not attribute_List == None:
             attributes_df.loc[len(attributes_df)] = attribute_List
         
     return attributes_df
