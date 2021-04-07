@@ -508,7 +508,8 @@ def get_attributes(events, stream, *attributes):
                 
                 name_list = ['event_id', 'stations', 'network_time', 'ref_time', 'ref_duration']
                 attribute_list = [events['event_id'][i], events['stations'][i], events['network_time'][i], start_time, end_time - start_time]
-                first_event = first_event + 1
+                if first_event == 0:
+                    first_event = 1
             except:
                 start_time = UTCDateTime(events['time'][i])
                 end_time = UTCDateTime(events['time'][i]) + events['duration'][i]
@@ -519,11 +520,13 @@ def get_attributes(events, stream, *attributes):
                         continue
                     name_list = ['event_id', 'station', 'components', 'time', 'duration']
                     attribute_list = [events['event_id'][i], events['station'][i], events['components'][i], start_time, end_time - start_time]
-                    first_event = first_event + 1
+                    if first_event == 0:
+                        first_event = 1
                 except: # this path is used by get_events function
                     name_list = ['time', 'duration']
                     attribute_list = [start_time, end_time - start_time]
-                    first_event = first_event + 1
+                    if first_event == 0:
+                        first_event = 1
                 
             # add waveform data during event to new stream
             component_stream = component_list[j].slice(start_time, end_time)
@@ -545,7 +548,6 @@ def get_attributes(events, stream, *attributes):
                     raise Exception('No events found: check event list and stream are for different time periods.')
                 else:
                     attribute_List = attribute_list
-                    #k = k + 1
             else:
                 for k in range(2, len(attribute_List)):
                     if not isinstance(attribute_List[k], (list, np.ndarray)):
@@ -555,6 +557,7 @@ def get_attributes(events, stream, *attributes):
         # create pandas dataframe to store attributes
         if first_event == 1:
             attributes_df = pd.DataFrame(columns=name_list)
+            first_event = 2
         # append attributes for each event to dataframe
         if first_event >= 1 and not attribute_List == None:
             attributes_df.loc[len(attributes_df)] = attribute_List
