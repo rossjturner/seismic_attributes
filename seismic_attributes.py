@@ -1095,7 +1095,7 @@ def __coincidence_trigger(trigger_type, thr_on, thr_off, stream, nseismometers, 
             else:
                 tmp_on = tmp_on - thr_travel_time
             # break if there is a gap in between the two triggers
-            if tmp_on > off + trigger_off_extension or k >= 3*nseismometers: # place limit on number of triggers; must be within a small time of the last trigger and up to 3N triggers in total
+            if tmp_on > off + trigger_off_extension: # place limit on number of triggers; must be within a small time of the last trigger
                 break
             event['time'].append(UTCDateTime(tmp_on))
             event['off_time'].append(UTCDateTime(tmp_off))
