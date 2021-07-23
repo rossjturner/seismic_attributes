@@ -879,7 +879,7 @@ def plot_correlations(attributes, filename=None, plot_type='matrix'):
         
 
 # define function to plot waveforms from trace database
-def plot_waveforms(events, event_id, start_buffer=10, end_buffer=30, filename=None, waveform_name='waveforms', station_name='stations', client=['IRIS', 'LMU', 'GFZ'], download=True):
+def plot_waveforms(events, event_id, start_buffer=10, end_buffer=30, filename=None, waveform_name='waveforms', station_name='stations', providers=['IRIS', 'LMU', 'GFZ'], download=True):
     
     # create new figure object for single day plot
     my_dpi = 150
@@ -915,7 +915,7 @@ def plot_waveforms(events, event_id, start_buffer=10, end_buffer=30, filename=No
         # only plot seismometers with the same channels as the first seismometer
         if i == 0 or np.array_equal(event['components'], channel_list):
             channel_list = event['components']
-            stream = get_waveforms(event['station'].split(".")[0], event['station'].split(".")[1], event['station'].split(".")[2], event['components'], event['time'] - start_buffer, event['time'] + event['duration'] + end_buffer, event_buffer=0, waveform_name=waveform_name, station_name=station_name, client=client, download=download)
+            stream = get_waveforms(event['station'].split(".")[0], event['station'].split(".")[1], event['station'].split(".")[2], event['components'], event['time'] - start_buffer, event['time'] + event['duration'] + end_buffer, event_buffer=0, waveform_name=waveform_name, station_name=station_name, providers=providers, download=download)
             stream_list.append(stream)
             # find domain and range of traces
             for trace in stream:
