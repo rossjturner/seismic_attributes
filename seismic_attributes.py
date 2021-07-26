@@ -279,7 +279,7 @@ def __make_catalogues(events, stream, events_list, stream_list, starttime, endti
             l = 0
             # find all events within range of reference event, including times extending beyond reference event
             for j in range(0, len(events_df['ref_time'])):
-                index = np.logical_and(np.any(np.asarray(events_df['stations'][j]) == stream_list[i][0].stats.network+'.'+stream_list[i][0].stats.station+'.'+stream_list[i][0].stats.location), np.logical_and(df['time'] <= events_df['ref_time'][j] + events_df['ref_duration'][j], df['time'] + df['duration'] >= events_df['ref_time'][j]))
+                index = np.logical_and(np.any(np.asarray(events_df['stations'][j]) == stream_list[i][0].stats.network+'.'+stream_list[i][0].stats.station+'.'+stream_list[i][0].stats.location), np.logical_and(df['time'] <= events_df['ref_time'][j] + events_df['ref_duration'][j] + thr_travel_time/2., df['time'] + df['duration'] + thr_travel_time/2. >= events_df['ref_time'][j]))
                 if np.sum(index) > 0:
                     trace_df.loc[l] = list([events_df['event_id'][j], df['stations'][0], components, np.min(df['time'][index]), np.max(df['time'][index] + df['duration'][index]) - np.min(df['time'][index])])
                     l = l + 1
