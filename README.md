@@ -29,7 +29,7 @@ python setup.py install
 
 ## Unit testing
 
-The successful installation of the package can be verified using the Python package _pytest_. The unit tests require internet access to run as data is downloaded from the Incorporated Research Institutions for Seismology (IRIS) server; the downloaded data will be saved in the working directory.
+The successful installation of the package can be verified using the Python package _pytest_. The unit tests require internet access to run as data is downloaded from the Incorporated Research Institutions for Seismology (IRIS) server; downloaded data will be saved in the working directory.
 
 ### Before the test
 
@@ -50,6 +50,10 @@ pytest path_to_directory/seismic_attributes
 ```
 
 The unit test takes approximately 10-20 seconds to run. Five tests are conducted which verify the _seismic_attributes_ package is correctly linked with _obspy_, can download data from the IRIS server, produces an event catalogue with the expected output, and calculates attributes for events as expected.
+
+## Documentation and Examples
+
+Full documentation of the functions included in the seismic_attributes package, in addition to worked examples, is included in seismic_attributes_user.pdf on the GitHUb repository.
 
 ## Contact
 
