@@ -33,7 +33,7 @@ The successful installation of the package can be verified using the Python pack
 
 ### Before the test
 
-Find the path to the installed _seismic_attributes_ package. If the package was installed using pip this is achieved as follows:
+Find the path to the installed _seismic_attributes_ package. If the package was installed using _pip_ this is achieved as follows:
 
 ```bash
 pip show seismic_attributes
