@@ -4,7 +4,7 @@ This package is an extension for the observational seismology obspy software pac
 
 ## Installation
 
-This package can either be installed using _pip_ or from a .zip file downloaded from the GitHub repository using the standard Python distutils.
+This package can either be installed using _pip_ or from a .zip file downloaded from the GitHub repository using the standard Python package _distutils_.
 
 ### Install using pip
 The following command will install the latest version of the _seismic attributes_ library from the Python Packaging Index (PyPI):
@@ -26,6 +26,30 @@ The package is installed by running the following command as an administrative u
 ```bash
 python setup.py install
 ```
+
+## Unit testing
+
+The successful installation of the package can be verified using the Python package _pytest_. The unit test requires internet access to run correctly as it involves downloading data from the Incorporated Research Institutions for Seismology (IRIS) server.
+
+### Before the test
+
+Find the path to the installed _seismic_attributes_ package. If the package was installed using pip this is achieved as follows:
+
+```bash
+pip show seismic_attributes
+```
+
+The path to the _seismic_attributes_ directory is shown next to 'Location:'.
+
+### Running the test
+
+The unit test is run with _pytest_ (which should be installed with _seismic_attributes_ by default) using the following command:
+
+```bash
+pytest path_to_directory/seismic_attributes
+```
+
+The unit test takes approximately 10-20 seconds to run. It tests the _seismic_attributes_ package is correctly linked with _obspy_, can download data from the IRIS server, produces an event catalogue with the expected output, and calculates attributes for events as expected.
 
 ## Contact
 
