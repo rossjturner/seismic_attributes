@@ -53,7 +53,7 @@ The unit test takes approximately 10-20 seconds to run. Five tests are conducted
 
 ## Documentation and Examples
 
-Full documentation of the functions included in the seismic_attributes package, in addition to worked examples, is included in [seismic_attributes_user.pdf](https://github.com/rossjturner/seismic_attributes/blob/main/seismic_attributes_user.pdf) on the GitHub repository.
+Full documentation of the functions included in the seismic_attributes package, in addition to worked examples, is included in [seismic_attributes_user.pdf](https://github.com/rossjturner/seismic_attributes/blob/main/seismic_attributes_user.pdf) on the GitHub repository. The worked examples are additionally included in the following Jupyter notebook: [seismic_attributes_example.ipynb](https://github.com/rossjturner/seismic_attributes/blob/main/seismic_attributes_example.ipynb).
 
 ## Contact
 
