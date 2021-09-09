@@ -49,7 +49,7 @@ The unit test is run with _pytest_ (which should be installed with _seismic_attr
 pytest path_to_directory/seismic_attributes
 ```
 
-The unit test takes approximately 10-20 seconds to run. It tests the _seismic_attributes_ package is correctly linked with _obspy_, can download data from the IRIS server, produces an event catalogue with the expected output, and calculates attributes for events as expected.
+The unit test takes approximately 10-20 seconds to run. Five tests are conducted which verify the _seismic_attributes_ package is correctly linked with _obspy_, can download data from the IRIS server, produces an event catalogue with the expected output, and calculates attributes for events as expected.
 
 ## Contact
 
