@@ -29,7 +29,7 @@ python setup.py install
 
 ## Unit testing
 
-The successful installation of the package can be verified using the Python package _pytest_. The unit tests require internet access to run as data is downloaded from the Incorporated Research Institutions for Seismology (IRIS) server.
+The successful installation of the package can be verified using the Python package _pytest_. The unit tests require internet access to run as data is downloaded from the Incorporated Research Institutions for Seismology (IRIS) server; the downloaded data will be saved in the working directory.
 
 ### Before the test
 
