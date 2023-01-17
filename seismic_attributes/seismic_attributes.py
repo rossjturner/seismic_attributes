@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # -------------------------------------------------------------------
-# Filename: seismic_attributes.py version 1.0.3
+# Filename: seismic_attributes.py version 1.0.5
 #  Purpose: An ObsPy library for event detection and seismic attribute
 #           calculation: preparing waveforms for automated analysis.
 #   Author: Ross Turner

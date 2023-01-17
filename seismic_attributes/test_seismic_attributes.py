@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # -------------------------------------------------------------------
-# Filename: test_seismic_attributes.py version 1.0.3
+# Filename: test_seismic_attributes.py version 1.0.5
 #  Purpose: Functions to test if the seismic_attributes package performs as expected.
 #   Author: Ross Turner
 #    Email: turner.rj@icloud.com
