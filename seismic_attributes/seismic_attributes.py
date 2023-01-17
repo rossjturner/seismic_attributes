@@ -618,15 +618,16 @@ def __coincidence_trigger(trigger_type, thr_on, thr_off, stream, nseismometers, 
         index = np.argsort(trigger_times.copy())
         
         # initialise variables
-        coincidence_sum, event['coincidence_sum'], join_time = 0, 0, None
+        coincidence_sum, event['coincidence_sum'], join_time, first_time = 0, 0, None, True
         event['stations'], event['trace_ids'] = [], []
         for i in range(0, len(index)):
             coincidence_sum = coincidence_sum + trigger_sum[index[i]]
             # coincidence sum region
             if coincidence_sum >= thr_coincidence_sum:
                 # set start time if over threshold for the first time
-                if isinstance(event['time'], list):
+                if first_time:
                     event['time'] = trigger_times[index[i]]
+                    first_time = False
                 # update end time
                 event['off_time'] = trigger_times[index[i]]
                 event['duration'] = event['off_time'] - event['time']
@@ -639,28 +640,25 @@ def __coincidence_trigger(trigger_type, thr_on, thr_off, stream, nseismometers, 
                 # reset join time if coincidence trigger condition met again
                 join_time = None
             else:
-                if coincidence_sum >= 1:
-                    # before coincidence sum region
-                    if isinstance(event['time'], list):
-                        # add station and trace_id to event catalogue and remove if it detriggers before coincidence sum region
-                        if trigger_sum[index[i]] > 0:
-                            event['stations'].append(trigger_stations[index[i]])
-                            event['trace_ids'].append(trigger_traces[index[i]])
-                        else:
-                            event['stations'].remove(trigger_stations[index[i]])
-                            event['trace_ids'].remove(trigger_traces[index[i]])
-                    # after coincidence sum region
+                # before coincidence sum region
+                if first_time:
+                    # add station and trace_id to event catalogue and remove if it detriggers before coincidence sum region
+                    if trigger_sum[index[i]] > 0:
+                        event['stations'].append(trigger_stations[index[i]])
+                        event['trace_ids'].append(trigger_traces[index[i]])
                     else:
-                        # update end time
-                        event['off_time'] = trigger_times[index[i]]
-                        event['duration'] = event['off_time'] - event['time']
-                        if join_time == None:
-                            join_time = event['off_time']
-                        elif (event['off_time'] - join_time) > thr_event_join:
-                            # only join if at least one seismometer active
-                            break
+                        event['stations'].remove(trigger_stations[index[i]])
+                        event['trace_ids'].remove(trigger_traces[index[i]])
+                # after coincidence sum region
                 else:
-                    break
+                    # update end time
+                    event['off_time'] = trigger_times[index[i]]
+                    event['duration'] = event['off_time'] - event['time']
+                    if join_time == None:
+                        join_time = event['off_time']
+                    elif (event['off_time'] - join_time) > thr_event_join:
+                        # only join if at least one seismometer active
+                        break
         # update end time and duration in case coincidence trigger did not join events
         if not join_time == None:
             event['off_time'] = join_time
